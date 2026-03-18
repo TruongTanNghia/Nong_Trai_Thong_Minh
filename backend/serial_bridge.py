@@ -96,6 +96,38 @@ def parse_cfg_line(line):
     return thresholds if thresholds else None
 
 
+# ★ Parse RELAY_STATE line from ESP32 → POST to backend
+def parse_relay_state_line(line):
+    """Parse RELAY_STATE:heater=1,fan=0,pump=0,mist=0 from ESP32."""
+    state_str = line[len("RELAY_STATE:"):]
+    states = {}
+
+    for pair in state_str.split(","):
+        if "=" in pair:
+            key, val = pair.split("=", 1)
+            key = key.strip()
+            try:
+                states[key] = int(val.strip()) == 1
+            except ValueError:
+                pass
+
+    return states if states else None
+
+
+def send_relay_state_to_server(states):
+    """POST trạng thái relay từ ESP32 lên backend."""
+    try:
+        response = requests.post(f"{API_URL}/api/relay/sync-from-device", json=states, timeout=5)
+        if response.status_code == 200:
+            print(f"   ✅ Đồng bộ relay ESP32 → Web: {states}")
+        else:
+            print(f"   ❌ Lỗi sync relay: HTTP {response.status_code}")
+    except requests.exceptions.ConnectionError:
+        print("   ⚠️ Không kết nối được backend!")
+    except Exception as e:
+        print(f"   ❌ Lỗi: {e}")
+
+
 def send_cfg_to_server(thresholds):
     """POST ngưỡng từ ESP32 lên backend."""
     try:
@@ -233,6 +265,15 @@ def main():
                     if thresholds:
                         print(f"\n⚙️ ESP32 gửi ngưỡng mới:")
                         send_cfg_to_server(thresholds)
+                        print()
+                    continue
+
+                # ★ Handle RELAY_STATE from ESP32
+                if line.startswith("RELAY_STATE:"):
+                    states = parse_relay_state_line(line)
+                    if states:
+                        print(f"\n🏛️ ESP32 relay thay đổi:")
+                        send_relay_state_to_server(states)
                         print()
                     continue
 

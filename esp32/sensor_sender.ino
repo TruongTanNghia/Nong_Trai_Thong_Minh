@@ -177,12 +177,40 @@ void relayWrite(uint8_t pin, bool on)
   digitalWrite(pin, on ? RELAY_ON : RELAY_OFF);
 }
 
+// ★ Trạng thái trước đó (để chỉ gửi khi thay đổi)
+bool prevHeater = false;
+bool prevFan    = false;
+bool prevPump   = false;
+bool prevMist   = false;
+
+// ★ Gửi trạng thái relay lên Serial → web
+void sendRelayStatesToSerial()
+{
+  Serial.print("RELAY_STATE:");
+  Serial.print("heater="); Serial.print(heaterState ? 1 : 0);
+  Serial.print(",fan="); Serial.print(fanState ? 1 : 0);
+  Serial.print(",pump="); Serial.print(pumpState ? 1 : 0);
+  Serial.print(",mist="); Serial.print(mistState ? 1 : 0);
+  Serial.println();
+}
+
 void applyOutputs()
 {
   relayWrite(RELAY_HEATER, heaterState);
   relayWrite(RELAY_FAN, fanState);
   relayWrite(RELAY_PUMP, pumpState);
   relayWrite(RELAY_MIST, mistState);
+
+  // ★ Chỉ gửi serial khi có thay đổi
+  if (heaterState != prevHeater || fanState != prevFan ||
+      pumpState != prevPump || mistState != prevMist)
+  {
+    sendRelayStatesToSerial();
+    prevHeater = heaterState;
+    prevFan = fanState;
+    prevPump = pumpState;
+    prevMist = mistState;
+  }
 }
 
 void turnOffAllOutputs()

@@ -356,6 +356,22 @@ async def get_pending_commands():
     return commands
 
 
+@app.post("/api/relay/sync-from-device")
+async def sync_relay_from_device(states: dict):
+    """★ ESP32 gửi trạng thái relay lên (qua serial_bridge) → cập nhật web."""
+    valid_relays = ["heater", "fan", "pump", "mist", "light"]
+    for key, val in states.items():
+        if key in valid_relays:
+            relay_states[key] = bool(val)
+
+    # Broadcast relay states to all WS clients → frontend cập nhật ngay
+    await manager.broadcast({
+        "type": "relay_states",
+        "states": relay_states,
+    })
+    return relay_states
+
+
 # ─── AI Analysis ─────────────────────────────────────────────────
 
 @app.post("/api/analysis", response_model=AnalysisResponse)
