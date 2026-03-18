@@ -14,6 +14,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
+from zalo_utils import load_zalo_config, save_zalo_config, fetch_chat_id_from_updates, send_zalo_text, format_sensor_message
+
 load_dotenv()
 
 # ─── Pydantic Schemas ────────────────────────────────────────────
@@ -127,6 +129,39 @@ auto_thresholds: dict = {
 }
 
 auto_control_log: list = []  # Recent auto actions
+
+# ─── Zalo Settings ───────────────────────────────────────────────
+zalo_config = load_zalo_config()
+
+# Cờ để kiểm soát việc gửi tự động
+zalo_auto_send: bool = True  # Mặc định bật
+zalo_send_interval: int = zalo_config.get("send_interval", 30)  # Giây
+
+# ─── Zalo Background Task ────────────────────────────────────────
+
+async def zalo_periodic_task():
+    """Gửi dữ liệu lên Zalo định kỳ theo khoảng thời gian cấu hình."""
+    while True:
+        try:
+            await asyncio.sleep(zalo_send_interval)
+            
+            if not zalo_auto_send:
+                continue
+                
+            token = zalo_config.get("bot_token")
+            chat_id = zalo_config.get("chat_id")
+            
+            if token and chat_id and latest_data:
+                msg = format_sensor_message(latest_data)
+                await asyncio.to_thread(send_zalo_text, token, chat_id, msg)
+                
+        except Exception as e:
+            print(f"⚠️ Lỗi trong zalo_periodic_task: {e}")
+
+@app.on_event("startup")
+async def startup_event():
+    # Khởi chạy Zalo task ngầm
+    asyncio.create_task(zalo_periodic_task())
 
 
 async def auto_control_check(data: dict):
@@ -370,6 +405,59 @@ async def sync_relay_from_device(states: dict):
         "states": relay_states,
     })
     return relay_states
+
+
+# ─── Zalo Config Endpoints ───────────────────────────────────────
+
+class ZaloConfigRequest(BaseModel):
+    bot_token: str
+    chat_id: str
+    send_interval: Optional[int] = None  # Giây, nếu None giữ nguyên
+
+@app.get("/api/zalo/config")
+async def get_zalo_config_endpoint():
+    """Lấy cấu hình Zalo hiện tại"""
+    return {
+        "bot_token": zalo_config.get("bot_token", ""),
+        "chat_id": zalo_config.get("chat_id", ""),
+        "auto_send": zalo_auto_send,
+        "send_interval": zalo_send_interval
+    }
+
+@app.post("/api/zalo/config")
+async def save_zalo_config_endpoint(req: ZaloConfigRequest):
+    """Lưu cấu hình Zalo"""
+    global zalo_config, zalo_send_interval
+    interval = req.send_interval if req.send_interval and req.send_interval >= 10 else zalo_send_interval
+    if save_zalo_config(req.bot_token, req.chat_id, interval):
+        zalo_config["bot_token"] = req.bot_token
+        zalo_config["chat_id"] = req.chat_id
+        zalo_config["send_interval"] = interval
+        zalo_send_interval = interval
+        return {"status": "ok", "message": "Đã lưu cấu hình Zalo thành công"}
+    else:
+        raise HTTPException(status_code=500, detail="Không thể lưu file cấu hình Zalo")
+
+class ZaloFetchIdRequest(BaseModel):
+    bot_token: str
+
+@app.post("/api/zalo/fetch-id")
+async def fetch_zalo_chat_id(req: ZaloFetchIdRequest):
+    """Lấy Chat ID tự động dựa trên Token"""
+    chat_id, error = await asyncio.to_thread(fetch_chat_id_from_updates, req.bot_token)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+    return {"chat_id": chat_id, "message": "Lấy Chat ID thành công!"}
+
+class ZaloToggleRequest(BaseModel):
+    auto_send: bool
+
+@app.post("/api/zalo/toggle")
+async def toggle_zalo_auto_send(req: ZaloToggleRequest):
+    """Bật/tắt việc gửi tự động Zalo"""
+    global zalo_auto_send
+    zalo_auto_send = req.auto_send
+    return {"status": "ok", "auto_send": zalo_auto_send}
 
 
 # ─── AI Analysis ─────────────────────────────────────────────────

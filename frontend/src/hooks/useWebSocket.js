@@ -66,12 +66,13 @@ export default function useWebSocket() {
         reconnectTimeout.current = setTimeout(connect, delay);
       };
 
-      ws.onerror = (error) => {
-        console.error("WebSocket error:", error);
+      ws.onerror = () => {
+        // Dùng warn thay error để tránh Next.js dev overlay hiển thị lỗi đỏ
+        console.warn("⚠️ WebSocket connection error, will reconnect...");
         ws.close();
       };
-    } catch (error) {
-      console.error("Failed to create WebSocket:", error);
+    } catch (err) {
+      console.warn("Failed to create WebSocket:", err);
       setConnectionStatus("disconnected");
     }
   }, []);

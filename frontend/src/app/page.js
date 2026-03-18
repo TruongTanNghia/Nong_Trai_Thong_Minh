@@ -6,6 +6,7 @@ import SensorCard from "@/components/SensorCard";
 import AIAnalysis from "@/components/AIAnalysis";
 import ControlPanel from "@/components/ControlPanel";
 import { getAllSensorKeys } from "@/lib/sensorConfig";
+import Link from "next/link";
 
 export default function Home() {
   const { sensorData, dataHistory, connectionStatus, lastUpdate } = useWebSocket();
@@ -63,6 +64,20 @@ export default function Home() {
               Cập nhật: {lastUpdate.toLocaleTimeString("vi-VN")}
             </span>
           )}
+          <Link href="/settings" style={{
+            display: "flex", 
+            alignItems: "center", 
+            justifyContent: "center",
+            width: "36px", 
+            height: "36px", 
+            background: "var(--bg-glass)", 
+            border: "1px solid var(--border-color)", 
+            borderRadius: "var(--radius-sm)",
+            marginLeft: "8px",
+            textDecoration: "none"
+          }} title="Cài đặt Hệ thống (Zalo)">
+            <span style={{ fontSize: "18px" }}>⚙️</span>
+          </Link>
         </div>
       </header>
 
