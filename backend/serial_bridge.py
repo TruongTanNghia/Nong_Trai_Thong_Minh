@@ -1,7 +1,9 @@
 """
-Serial Bridge v2: 
+Serial Bridge v3: ESP32 ↔ Web bidirectional sync
   1. Đọc data từ ESP32 qua Serial → gửi HTTP POST lên FastAPI backend
   2. Poll backend cho relay commands → gửi xuống ESP32 qua Serial
+  3. ★ Đọc CFG từ ESP32 → POST lên /api/auto/thresholds (ESP32 → Web)
+  4. ★ Poll settings commands → gửi CFG xuống ESP32 (Web → ESP32)
 
 Cách dùng:
   python serial_bridge.py          (tự tìm COM port)
@@ -64,6 +66,51 @@ def parse_serial_data(lines):
     return data if len(data) >= 5 else None
 
 
+# ★ Parse CFG line from ESP32 → POST to backend
+def parse_cfg_line(line):
+    """Parse CFG:tempLow=20.0,tempHigh=30.0,... from ESP32."""
+    cfg_str = line[4:]  # skip "CFG:"
+    thresholds = {}
+    
+    # Map ESP32 key names → backend API key names
+    key_map = {
+        "tempLow": "temp_low",
+        "tempHigh": "temp_high",
+        "airHumiLow": "air_humi_low",
+        "airHumiHigh": "air_humi_high",
+        "soilHumiLow": "soil_humi_low",
+        "soilHumiHigh": "soil_humi_high",
+    }
+    
+    for pair in cfg_str.split(","):
+        if "=" in pair:
+            key, val = pair.split("=", 1)
+            key = key.strip()
+            api_key = key_map.get(key)
+            if api_key:
+                try:
+                    thresholds[api_key] = float(val.strip())
+                except ValueError:
+                    pass
+
+    return thresholds if thresholds else None
+
+
+def send_cfg_to_server(thresholds):
+    """POST ngưỡng từ ESP32 lên backend."""
+    try:
+        response = requests.post(f"{API_URL}/api/auto/thresholds", json=thresholds, timeout=5)
+        if response.status_code == 200:
+            print(f"   ✅ Đồng bộ ngưỡng ESP32 → Web thành công!")
+            print(f"      {thresholds}")
+        else:
+            print(f"   ❌ Lỗi sync ngưỡng: HTTP {response.status_code}")
+    except requests.exceptions.ConnectionError:
+        print("   ⚠️ Không kết nối được backend!")
+    except Exception as e:
+        print(f"   ❌ Lỗi: {e}")
+
+
 def send_to_server(data):
     """Gửi sensor data lên FastAPI backend."""
     try:
@@ -79,7 +126,7 @@ def send_to_server(data):
 
 
 def relay_command_poller(ser, stop_event):
-    """Thread: Poll backend cho relay commands → gửi xuống ESP32."""
+    """Thread: Poll backend cho relay commands + settings commands → gửi xuống ESP32."""
     relay_name_map = {
         "heater": "HEATER",
         "fan": "FAN",
@@ -87,20 +134,46 @@ def relay_command_poller(ser, stop_event):
         "mist": "MIST",
         "light": "LIGHT",
     }
+    
+    # ★ Map backend key → ESP32 key
+    threshold_key_map = {
+        "temp_low": "tempLow",
+        "temp_high": "tempHigh",
+        "air_humi_low": "airHumiLow",
+        "air_humi_high": "airHumiHigh",
+        "soil_humi_low": "soilHumiLow",
+        "soil_humi_high": "soilHumiHigh",
+    }
 
     while not stop_event.is_set():
         try:
+            # Poll relay commands
             response = requests.get(f"{API_URL}/api/relay/pending", timeout=3)
             if response.status_code == 200:
                 commands = response.json()
                 for cmd in commands:
-                    relay = cmd.get("relay", "")
-                    state = cmd.get("state", False)
-                    relay_upper = relay_name_map.get(relay, relay.upper())
-                    serial_cmd = f"RELAY:{relay_upper}:{'ON' if state else 'OFF'}\n"
+                    cmd_type = cmd.get("type", "relay_command")
                     
-                    ser.write(serial_cmd.encode())
-                    print(f"   🎛️ Gửi lệnh: {serial_cmd.strip()}")
+                    if cmd_type == "relay_command":
+                        relay = cmd.get("relay", "")
+                        state = cmd.get("state", False)
+                        relay_upper = relay_name_map.get(relay, relay.upper())
+                        serial_cmd = f"RELAY:{relay_upper}:{'ON' if state else 'OFF'}\n"
+                        ser.write(serial_cmd.encode())
+                        print(f"   🎛️ Gửi lệnh: {serial_cmd.strip()}")
+                    
+                    elif cmd_type == "settings_command":
+                        # ★ Web → ESP32: gửi ngưỡng mới
+                        thresholds = cmd.get("thresholds", {})
+                        parts = []
+                        for api_key, esp_key in threshold_key_map.items():
+                            if api_key in thresholds:
+                                parts.append(f"{esp_key}={thresholds[api_key]}")
+                        if parts:
+                            cfg_cmd = "CFG:" + ",".join(parts) + "\n"
+                            ser.write(cfg_cmd.encode())
+                            print(f"   ⚙️ Gửi ngưỡng → ESP32: {cfg_cmd.strip()}")
+
         except requests.exceptions.ConnectionError:
             pass
         except Exception as e:
@@ -124,6 +197,7 @@ def main():
     print(f"\n🔌 Kết nối Serial: {port} @ 115200 baud")
     print(f"🌐 Backend: {API_URL}")
     print(f"🎛️ Relay command polling: mỗi {RELAY_POLL_INTERVAL}s")
+    print(f"⚙️ Threshold sync: ESP32 ↔ Web bidirectional")
     print(f"   Nhấn Ctrl+C để dừng\n")
 
     try:
@@ -138,7 +212,7 @@ def main():
     stop_event = threading.Event()
     relay_thread = threading.Thread(target=relay_command_poller, args=(ser, stop_event), daemon=True)
     relay_thread.start()
-    print("🎛️ Relay command thread started.\n")
+    print("🎛️ Relay + Settings command thread started.\n")
 
     buffer = []
     count = 0
@@ -152,6 +226,15 @@ def main():
                     continue
 
                 print(f"   📡 {line}")
+
+                # ★ Handle CFG line from ESP32
+                if line.startswith("CFG:"):
+                    thresholds = parse_cfg_line(line)
+                    if thresholds:
+                        print(f"\n⚙️ ESP32 gửi ngưỡng mới:")
+                        send_cfg_to_server(thresholds)
+                        print()
+                    continue
 
                 if "DATA NODE" in line:
                     buffer = []

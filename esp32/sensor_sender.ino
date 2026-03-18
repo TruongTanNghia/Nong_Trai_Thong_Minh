@@ -41,7 +41,7 @@ static const unsigned long NODE_TIMEOUT_MS = 15000;
 
 //================ BUFFER =================
 static const size_t LORA_BUFFER_SIZE = 128;
-static const size_t SERIAL_CMD_BUFFER_SIZE = 64;
+static const size_t SERIAL_CMD_BUFFER_SIZE = 200;
 
 //================ OBJECTS =================
 HardwareSerial LORA(1);
@@ -175,6 +175,19 @@ void loadSettings()
   if (cfg.soilHumiLow >= cfg.soilHumiHigh) { cfg.soilHumiLow = 40.0; cfg.soilHumiHigh = 55.0; }
 }
 
+void sendSettingsToSerial()
+{
+  // Format: CFG:tempLow=20.0,tempHigh=30.0,airHumiLow=60.0,airHumiHigh=75.0,soilHumiLow=40.0,soilHumiHigh=55.0
+  Serial.print("CFG:");
+  Serial.print("tempLow="); Serial.print(cfg.tempLow, 1);
+  Serial.print(",tempHigh="); Serial.print(cfg.tempHigh, 1);
+  Serial.print(",airHumiLow="); Serial.print(cfg.airHumiLow, 1);
+  Serial.print(",airHumiHigh="); Serial.print(cfg.airHumiHigh, 1);
+  Serial.print(",soilHumiLow="); Serial.print(cfg.soilHumiLow, 1);
+  Serial.print(",soilHumiHigh="); Serial.print(cfg.soilHumiHigh, 1);
+  Serial.println();
+}
+
 void saveSettings()
 {
   prefs.begin("gateway_cfg", false);
@@ -185,6 +198,9 @@ void saveSettings()
   prefs.putFloat("soilLow", cfg.soilHumiLow);
   prefs.putFloat("soilHigh", cfg.soilHumiHigh);
   prefs.end();
+
+  // ★ Gửi settings lên Serial → serial_bridge → web
+  sendSettingsToSerial();
 }
 
 //================ PARSE DATA =================
@@ -242,13 +258,61 @@ bool parseDataPacket(const char* packet, SensorData& outData)
   return true;
 }
 
+//================ ★ PARSE CFG FROM WEB ★ =================
+// Format: CFG:tempLow=20.0,tempHigh=30.0,airHumiLow=60.0,...
+void parseCfgFromSerial(const char* cfgStr)
+{
+  char buf[SERIAL_CMD_BUFFER_SIZE];
+  strncpy(buf, cfgStr, sizeof(buf) - 1);
+  buf[sizeof(buf) - 1] = '\0';
+
+  char* savePtr = nullptr;
+  char* pair = strtok_r(buf, ",", &savePtr);
+
+  while (pair != nullptr)
+  {
+    char* eq = strchr(pair, '=');
+    if (eq != nullptr)
+    {
+      *eq = '\0';
+      char* key = pair;
+      float val = atof(eq + 1);
+
+      if (strcmp(key, "tempLow") == 0)      cfg.tempLow = val;
+      else if (strcmp(key, "tempHigh") == 0) cfg.tempHigh = val;
+      else if (strcmp(key, "airHumiLow") == 0)  cfg.airHumiLow = val;
+      else if (strcmp(key, "airHumiHigh") == 0) cfg.airHumiHigh = val;
+      else if (strcmp(key, "soilHumiLow") == 0)  cfg.soilHumiLow = val;
+      else if (strcmp(key, "soilHumiHigh") == 0) cfg.soilHumiHigh = val;
+    }
+    pair = strtok_r(nullptr, ",", &savePtr);
+  }
+
+  // Lưu vào flash
+  saveSettings();
+
+  Serial.println(">> CFG updated from web!");
+  Serial.print(">> tempLow="); Serial.print(cfg.tempLow);
+  Serial.print(" tempHigh="); Serial.print(cfg.tempHigh);
+  Serial.print(" airLow="); Serial.print(cfg.airHumiLow);
+  Serial.print(" airHigh="); Serial.print(cfg.airHumiHigh);
+  Serial.print(" soilLow="); Serial.print(cfg.soilHumiLow);
+  Serial.print(" soilHigh="); Serial.println(cfg.soilHumiHigh);
+}
+
 //================ ★ SERIAL COMMAND HANDLER ★ =================
-// Format: RELAY:NAME:ON  hoặc  RELAY:NAME:OFF
-// Vi du: RELAY:HEATER:ON, RELAY:FAN:OFF, RELAY:LIGHT:ON
+// Format: RELAY:NAME:ON/OFF  hoặc  CFG:tempLow=20.0,tempHigh=30.0,...
 void handleSerialCommand(const char* cmd)
 {
   Serial.print(">> CMD: ");
   Serial.println(cmd);
+
+  // ★ Parse CFG (settings from web)
+  if (strncmp(cmd, "CFG:", 4) == 0)
+  {
+    parseCfgFromSerial(cmd + 4);
+    return;
+  }
 
   // Parse RELAY:NAME:STATE
   if (strncmp(cmd, "RELAY:", 6) != 0)
@@ -721,6 +785,10 @@ void setup()
   memset(serialCmdBuffer, 0, sizeof(serialCmdBuffer));
 
   delay(1200);
+
+  // ★ Gửi settings hiện tại lên Serial khi khởi động → sync web
+  sendSettingsToSerial();
+
   updateDisplay();
 }
 

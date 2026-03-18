@@ -308,6 +308,11 @@ async def update_thresholds(t: AutoThresholds):
     # Chạy auto-control ngay với ngưỡng mới
     if auto_mode and latest_data:
         await auto_control_check(latest_data)
+    # ★ Queue settings command để serial bridge gửi xuống ESP32
+    relay_command_queue.append({
+        "type": "settings_command",
+        "thresholds": dict(auto_thresholds),
+    })
     return auto_thresholds
 
 
