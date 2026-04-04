@@ -33,8 +33,15 @@ export default function useWebSocket() {
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
+
+          // Bỏ qua ping
           if (data.type === "ping") return;
 
+          // ★ Bỏ qua system messages (auto_mode, relay_states, relay_update, relay_command)
+          // Các message này được ControlPanel xử lý qua polling
+          if (data.type) return;
+
+          // Chỉ sensor data (không có field 'type') mới cập nhật sensorData + history
           setSensorData(data);
           setLastUpdate(new Date());
 

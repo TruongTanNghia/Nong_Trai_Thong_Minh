@@ -27,6 +27,7 @@
 #define RELAY_FAN    12
 #define RELAY_PUMP   13
 #define RELAY_MIST   15
+#define RELAY_LIGHT  16
 
 //================ RELAY LOGIC =================
 #define RELAY_ON  HIGH
@@ -37,7 +38,7 @@ static const unsigned long NODE_TIMEOUT_MS = 15000;
 
 //================ BUFFER =================
 static const size_t LORA_BUFFER_SIZE = 128;
-static const size_t SERIAL_CMD_BUFFER_SIZE = 200;  // ★ Serial command buffer
+static const size_t SERIAL_CMD_BUFFER_SIZE = 200;
 
 //================ OBJECTS =================
 HardwareSerial LORA(1);
@@ -72,15 +73,16 @@ struct Settings
 };
 
 //================ DEFAULT SETTINGS =================
-Settings cfg = {
-  20.0,  // tempLow
-  30.0,  // tempHigh
-  60.0,  // airHumiLow
-  80.0,  // airHumiHigh
-  30.0,  // soilHumiLow
-  60.0   // soilHumiHigh
+static const Settings DEFAULT_CFG = {
+  20.0,
+  30.0,
+  60.0,
+  80.0,
+  30.0,
+  60.0
 };
 
+Settings cfg = DEFAULT_CFG;
 SensorData currentData = {0};
 
 //================ STATE =================
@@ -88,10 +90,8 @@ char loraBuffer[LORA_BUFFER_SIZE];
 size_t loraIndex = 0;
 bool isReceivingPacket = false;
 bool hasValidData = false;
-
 unsigned long lastNodeTime = 0;
 
-//================ SERIAL CMD BUFFER ===== ★ MỚI =====
 char serialCmdBuffer[SERIAL_CMD_BUFFER_SIZE];
 size_t serialCmdIndex = 0;
 
@@ -100,6 +100,14 @@ bool heaterState = false;
 bool fanState    = false;
 bool pumpState   = false;
 bool mistState   = false;
+bool lightState  = false;
+
+//================ PREVIOUS OUTPUT STATE =================
+bool prevHeater = false;
+bool prevFan    = false;
+bool prevPump   = false;
+bool prevMist   = false;
+bool prevLight  = false;
 
 //================ CONTROL MODE =================
 enum ControlMode
@@ -155,6 +163,7 @@ enum ManualMenuItem
   MAN_FAN,
   MAN_PUMP,
   MAN_MIST,
+  MAN_LIGHT,
   MAN_EXIT
 };
 
@@ -177,51 +186,6 @@ void relayWrite(uint8_t pin, bool on)
   digitalWrite(pin, on ? RELAY_ON : RELAY_OFF);
 }
 
-// ★ Trạng thái trước đó (để chỉ gửi khi thay đổi)
-bool prevHeater = false;
-bool prevFan    = false;
-bool prevPump   = false;
-bool prevMist   = false;
-
-// ★ Gửi trạng thái relay lên Serial → web
-void sendRelayStatesToSerial()
-{
-  Serial.print("RELAY_STATE:");
-  Serial.print("heater="); Serial.print(heaterState ? 1 : 0);
-  Serial.print(",fan="); Serial.print(fanState ? 1 : 0);
-  Serial.print(",pump="); Serial.print(pumpState ? 1 : 0);
-  Serial.print(",mist="); Serial.print(mistState ? 1 : 0);
-  Serial.println();
-}
-
-void applyOutputs()
-{
-  relayWrite(RELAY_HEATER, heaterState);
-  relayWrite(RELAY_FAN, fanState);
-  relayWrite(RELAY_PUMP, pumpState);
-  relayWrite(RELAY_MIST, mistState);
-
-  // ★ Chỉ gửi serial khi có thay đổi
-  if (heaterState != prevHeater || fanState != prevFan ||
-      pumpState != prevPump || mistState != prevMist)
-  {
-    sendRelayStatesToSerial();
-    prevHeater = heaterState;
-    prevFan = fanState;
-    prevPump = pumpState;
-    prevMist = mistState;
-  }
-}
-
-void turnOffAllOutputs()
-{
-  heaterState = false;
-  fanState = false;
-  pumpState = false;
-  mistState = false;
-  applyOutputs();
-}
-
 bool isNumericToken(const char* token)
 {
   if (token == nullptr || *token == '\0') return false;
@@ -230,8 +194,71 @@ bool isNumericToken(const char* token)
   return (*endPtr == '\0');
 }
 
-//================ ★ SERIAL SYNC ★ =================
-// Gửi settings lên Serial → serial_bridge → web
+template<typename T>
+T clampValue(T value, T minVal, T maxVal)
+{
+  if (value < minVal) return minVal;
+  if (value > maxVal) return maxVal;
+  return value;
+}
+
+bool validateSensorData(const SensorData& d)
+{
+  if (d.airTemp   < -20.0f || d.airTemp   > 80.0f)  return false;
+  if (d.airHumi   <   0.0f || d.airHumi   > 100.0f) return false;
+  if (d.soilTemp  < -20.0f || d.soilTemp  > 80.0f)  return false;
+  if (d.soilHumi  <   0.0f || d.soilHumi  > 100.0f) return false;
+  if (d.ph        <   0.0f || d.ph        > 14.0f)  return false;
+
+  if (d.salinity  < 0) return false;
+  if (d.ec        < 0) return false;
+  if (d.nitrogen  < 0) return false;
+  if (d.phosphorus < 0) return false;
+  if (d.potassium < 0) return false;
+
+  return true;
+}
+
+void validateSettings(Settings &s)
+{
+  s.tempLow      = clampValue(s.tempLow, 0.0f, 79.5f);
+  s.tempHigh     = clampValue(s.tempHigh, 0.5f, 80.0f);
+  s.airHumiLow   = clampValue(s.airHumiLow, 0.0f, 99.0f);
+  s.airHumiHigh  = clampValue(s.airHumiHigh, 1.0f, 100.0f);
+  s.soilHumiLow  = clampValue(s.soilHumiLow, 0.0f, 99.0f);
+  s.soilHumiHigh = clampValue(s.soilHumiHigh, 1.0f, 100.0f);
+
+  if (s.tempLow >= s.tempHigh)
+  {
+    s.tempLow = DEFAULT_CFG.tempLow;
+    s.tempHigh = DEFAULT_CFG.tempHigh;
+  }
+
+  if (s.airHumiLow >= s.airHumiHigh)
+  {
+    s.airHumiLow = DEFAULT_CFG.airHumiLow;
+    s.airHumiHigh = DEFAULT_CFG.airHumiHigh;
+  }
+
+  if (s.soilHumiLow >= s.soilHumiHigh)
+  {
+    s.soilHumiLow = DEFAULT_CFG.soilHumiLow;
+    s.soilHumiHigh = DEFAULT_CFG.soilHumiHigh;
+  }
+}
+
+//================ SERIAL SYNC =================
+void sendRelayStatesToSerial()
+{
+  Serial.print("RELAY_STATE:");
+  Serial.print("heater="); Serial.print(heaterState ? 1 : 0);
+  Serial.print(",fan=");   Serial.print(fanState ? 1 : 0);
+  Serial.print(",pump=");  Serial.print(pumpState ? 1 : 0);
+  Serial.print(",mist=");  Serial.print(mistState ? 1 : 0);
+  Serial.print(",light="); Serial.print(lightState ? 1 : 0);
+  Serial.println();
+}
+
 void sendSettingsToSerial()
 {
   Serial.print("CFG:");
@@ -244,25 +271,63 @@ void sendSettingsToSerial()
   Serial.println();
 }
 
+void sendModeToSerial()
+{
+  Serial.print("MODE:");
+  Serial.println(controlMode == MODE_AUTO ? "AUTO" : "MANUAL");
+}
+
+//================ OUTPUT =================
+void applyOutputs()
+{
+  relayWrite(RELAY_HEATER, heaterState);
+  relayWrite(RELAY_FAN, fanState);
+  relayWrite(RELAY_PUMP, pumpState);
+  relayWrite(RELAY_MIST, mistState);
+  relayWrite(RELAY_LIGHT, lightState);
+
+  if (heaterState != prevHeater || fanState != prevFan ||
+      pumpState != prevPump || mistState != prevMist ||
+      lightState != prevLight)
+  {
+    sendRelayStatesToSerial();
+    prevHeater = heaterState;
+    prevFan = fanState;
+    prevPump = pumpState;
+    prevMist = mistState;
+    prevLight = lightState;
+  }
+}
+
+void turnOffAllOutputs()
+{
+  heaterState = false;
+  fanState = false;
+  pumpState = false;
+  mistState = false;
+  lightState = false;
+  applyOutputs();
+}
+
 //================ SETTINGS =================
 void loadSettings()
 {
   prefs.begin("gateway_cfg", true);
-  cfg.tempLow      = prefs.getFloat("tempLow", 20.0);
-  cfg.tempHigh     = prefs.getFloat("tempHigh", 30.0);
-  cfg.airHumiLow   = prefs.getFloat("airLow", 60.0);
-  cfg.airHumiHigh  = prefs.getFloat("airHigh", 80.0);
-  cfg.soilHumiLow  = prefs.getFloat("soilLow", 30.0);
-  cfg.soilHumiHigh = prefs.getFloat("soilHigh", 60.0);
+  cfg.tempLow      = prefs.getFloat("tempLow", DEFAULT_CFG.tempLow);
+  cfg.tempHigh     = prefs.getFloat("tempHigh", DEFAULT_CFG.tempHigh);
+  cfg.airHumiLow   = prefs.getFloat("airLow", DEFAULT_CFG.airHumiLow);
+  cfg.airHumiHigh  = prefs.getFloat("airHigh", DEFAULT_CFG.airHumiHigh);
+  cfg.soilHumiLow  = prefs.getFloat("soilLow", DEFAULT_CFG.soilHumiLow);
+  cfg.soilHumiHigh = prefs.getFloat("soilHigh", DEFAULT_CFG.soilHumiHigh);
   prefs.end();
 
-  if (cfg.tempLow >= cfg.tempHigh)       { cfg.tempLow = 20.0; cfg.tempHigh = 30.0; }
-  if (cfg.airHumiLow >= cfg.airHumiHigh) { cfg.airHumiLow = 60.0; cfg.airHumiHigh = 80.0; }
-  if (cfg.soilHumiLow >= cfg.soilHumiHigh) { cfg.soilHumiLow = 30.0; cfg.soilHumiHigh = 60.0; }
+  validateSettings(cfg);
 }
 
 void saveSettings()
 {
+  validateSettings(cfg);
+
   prefs.begin("gateway_cfg", false);
   prefs.putFloat("tempLow", cfg.tempLow);
   prefs.putFloat("tempHigh", cfg.tempHigh);
@@ -272,7 +337,6 @@ void saveSettings()
   prefs.putFloat("soilHigh", cfg.soilHumiHigh);
   prefs.end();
 
-  // ★ Gửi settings lên Serial → sync web
   sendSettingsToSerial();
 }
 
@@ -323,13 +387,14 @@ bool parseDataPacket(const char* packet, SensorData& outData)
   outData.potassium  = atoi(tokens[8]);
   outData.ph         = atof(tokens[9]);
 
-  return true;
+  return validateSensorData(outData);
 }
 
-//================ ★ SERIAL COMMANDS ★ =================
-// Parse CFG from web: CFG:tempLow=20.0,tempHigh=30.0,...
+//================ SERIAL COMMANDS =================
 void parseCfgFromSerial(const char* cfgStr)
 {
+  Settings newCfg = cfg;
+
   char buf[SERIAL_CMD_BUFFER_SIZE];
   strncpy(buf, cfgStr, sizeof(buf) - 1);
   buf[sizeof(buf) - 1] = '\0';
@@ -346,30 +411,23 @@ void parseCfgFromSerial(const char* cfgStr)
       char* key = pair;
       float val = atof(eq + 1);
 
-      if (strcmp(key, "tempLow") == 0)           cfg.tempLow = val;
-      else if (strcmp(key, "tempHigh") == 0)      cfg.tempHigh = val;
-      else if (strcmp(key, "airHumiLow") == 0)    cfg.airHumiLow = val;
-      else if (strcmp(key, "airHumiHigh") == 0)   cfg.airHumiHigh = val;
-      else if (strcmp(key, "soilHumiLow") == 0)   cfg.soilHumiLow = val;
-      else if (strcmp(key, "soilHumiHigh") == 0)  cfg.soilHumiHigh = val;
+      if (strcmp(key, "tempLow") == 0)            newCfg.tempLow = val;
+      else if (strcmp(key, "tempHigh") == 0)      newCfg.tempHigh = val;
+      else if (strcmp(key, "airHumiLow") == 0)    newCfg.airHumiLow = val;
+      else if (strcmp(key, "airHumiHigh") == 0)   newCfg.airHumiHigh = val;
+      else if (strcmp(key, "soilHumiLow") == 0)   newCfg.soilHumiLow = val;
+      else if (strcmp(key, "soilHumiHigh") == 0)  newCfg.soilHumiHigh = val;
     }
     pair = strtok_r(nullptr, ",", &savePtr);
   }
 
-  // Lưu vào flash (nhưng KHÔNG gọi sendSettingsToSerial để tránh loop)
-  prefs.begin("gateway_cfg", false);
-  prefs.putFloat("tempLow", cfg.tempLow);
-  prefs.putFloat("tempHigh", cfg.tempHigh);
-  prefs.putFloat("airLow", cfg.airHumiLow);
-  prefs.putFloat("airHigh", cfg.airHumiHigh);
-  prefs.putFloat("soilLow", cfg.soilHumiLow);
-  prefs.putFloat("soilHigh", cfg.soilHumiHigh);
-  prefs.end();
+  validateSettings(newCfg);
+  cfg = newCfg;
+  saveSettings();
 
   Serial.println(">> CFG updated from web!");
 }
 
-// Handle RELAY commands: RELAY:HEATER:ON
 void handleRelayCommand(const char* relayCmd)
 {
   char cmdCopy[64];
@@ -383,16 +441,37 @@ void handleRelayCommand(const char* relayCmd)
   char* relayName = cmdCopy;
   char* stateStr = colon + 1;
 
-  bool state = (strcmp(stateStr, "ON") == 0);
+  bool validState = false;
+  bool state = false;
 
-  if (strcmp(relayName, "HEATER") == 0)     { heaterState = state; }
-  else if (strcmp(relayName, "FAN") == 0)    { fanState = state; }
-  else if (strcmp(relayName, "PUMP") == 0)   { pumpState = state; }
-  else if (strcmp(relayName, "MIST") == 0)   { mistState = state; }
+  if (strcmp(stateStr, "ON") == 0)
+  {
+    validState = true;
+    state = true;
+  }
+  else if (strcmp(stateStr, "OFF") == 0)
+  {
+    validState = true;
+    state = false;
+  }
+
+  if (!validState) return;
+
+  // CHI CHO DIEU KHIEN TAY KHI DANG MANUAL
+  if (controlMode != MODE_MANUAL)
+  {
+    Serial.println(">> IGNORE: relay command only works in MANUAL mode");
+    return;
+  }
+
+  if (strcmp(relayName, "HEATER") == 0)         { heaterState = state; }
+  else if (strcmp(relayName, "FAN") == 0)       { fanState = state; }
+  else if (strcmp(relayName, "PUMP") == 0)      { pumpState = state; }
+  else if (strcmp(relayName, "MIST") == 0)      { mistState = state; }
+  else if (strcmp(relayName, "LIGHT") == 0)     { lightState = state; }
   else { return; }
 
   applyOutputs();
-  controlMode = MODE_MANUAL;  // Web đang control → chuyển manual
 
   Serial.print(">> OK: ");
   Serial.print(relayName);
@@ -400,7 +479,38 @@ void handleRelayCommand(const char* relayCmd)
   Serial.println(state ? "ON" : "OFF");
 }
 
-// Main serial command dispatcher
+void handleModeCommand(const char* modeCmd)
+{
+  if (strcmp(modeCmd, "AUTO") == 0)
+  {
+    controlMode = MODE_AUTO;
+
+    if (hasValidData)
+      controlOutputsAuto(currentData);
+    else
+      turnOffAllOutputs();
+
+    sendModeToSerial();
+    Serial.println(">> MODE set to AUTO");
+
+    if (uiState == UI_HOME) updateHomeDisplay();
+    else if (uiState == UI_MAIN_MENU) displayMainMenu();
+    else if (uiState == UI_SETTINGS_MENU) displaySettingsMenu();
+    else if (uiState == UI_MANUAL_MENU) displayManualMenu();
+  }
+  else if (strcmp(modeCmd, "MANUAL") == 0)
+  {
+    controlMode = MODE_MANUAL;
+    sendModeToSerial();
+    Serial.println(">> MODE set to MANUAL");
+
+    if (uiState == UI_HOME) updateHomeDisplay();
+    else if (uiState == UI_MAIN_MENU) displayMainMenu();
+    else if (uiState == UI_SETTINGS_MENU) displaySettingsMenu();
+    else if (uiState == UI_MANUAL_MENU) displayManualMenu();
+  }
+}
+
 void handleSerialCommand(const char* cmd)
 {
   if (strncmp(cmd, "CFG:", 4) == 0)
@@ -411,9 +521,24 @@ void handleSerialCommand(const char* cmd)
   {
     handleRelayCommand(cmd + 6);
   }
+  else if (strncmp(cmd, "MODE:", 5) == 0)
+  {
+    handleModeCommand(cmd + 5);
+  }
+  else if (strcmp(cmd, "GET:MODE") == 0)
+  {
+    sendModeToSerial();
+  }
+  else if (strcmp(cmd, "GET:CFG") == 0)
+  {
+    sendSettingsToSerial();
+  }
+  else if (strcmp(cmd, "GET:RELAY") == 0)
+  {
+    sendRelayStatesToSerial();
+  }
 }
 
-// Read serial commands from bridge
 void readSerialCommands()
 {
   while (Serial.available())
@@ -583,24 +708,35 @@ void displayManualMenu()
       lcd.setCursor(0, 2); lcd.print("UP=ON  DOWN=OFF");
       lcd.setCursor(0, 3); lcd.print("MODE=Next");
       break;
+
     case MAN_FAN:
       lcd.setCursor(0, 0); lcd.print("MANUAL: FAN");
       lcd.setCursor(0, 1); lcd.print("State: "); lcd.print(fanState ? "ON" : "OFF");
       lcd.setCursor(0, 2); lcd.print("UP=ON  DOWN=OFF");
       lcd.setCursor(0, 3); lcd.print("MODE=Next");
       break;
+
     case MAN_PUMP:
       lcd.setCursor(0, 0); lcd.print("MANUAL: PUMP");
       lcd.setCursor(0, 1); lcd.print("State: "); lcd.print(pumpState ? "ON" : "OFF");
       lcd.setCursor(0, 2); lcd.print("UP=ON  DOWN=OFF");
       lcd.setCursor(0, 3); lcd.print("MODE=Next");
       break;
+
     case MAN_MIST:
       lcd.setCursor(0, 0); lcd.print("MANUAL: MIST");
       lcd.setCursor(0, 1); lcd.print("State: "); lcd.print(mistState ? "ON" : "OFF");
       lcd.setCursor(0, 2); lcd.print("UP=ON  DOWN=OFF");
       lcd.setCursor(0, 3); lcd.print("MODE=Next");
       break;
+
+    case MAN_LIGHT:
+      lcd.setCursor(0, 0); lcd.print("MANUAL: LIGHT");
+      lcd.setCursor(0, 1); lcd.print("State: "); lcd.print(lightState ? "ON" : "OFF");
+      lcd.setCursor(0, 2); lcd.print("UP=ON  DOWN=OFF");
+      lcd.setCursor(0, 3); lcd.print("MODE=Next");
+      break;
+
     case MAN_EXIT:
       lcd.setCursor(0, 0); lcd.print("EXIT MANUAL ?");
       lcd.setCursor(0, 1); lcd.print("UP = Home");
@@ -635,15 +771,29 @@ void controlOutputsAuto(const SensorData& data)
 {
   if (controlMode != MODE_AUTO) return;
 
-  if (data.airTemp < cfg.tempLow)      { heaterState = true; fanState = false; }
-  else if (data.airTemp > cfg.tempHigh) { heaterState = false; fanState = true; }
+  if (data.airTemp < cfg.tempLow)
+  {
+    heaterState = true;
+    fanState = false;
+  }
+  else if (data.airTemp > cfg.tempHigh)
+  {
+    heaterState = false;
+    fanState = true;
+  }
+  else
+  {
+    heaterState = false;
+    fanState = false;
+  }
 
   if (data.airHumi < cfg.airHumiLow)       mistState = true;
-  else if (data.airHumi > cfg.airHumiHigh)  mistState = false;
+  else if (data.airHumi > cfg.airHumiHigh) mistState = false;
 
-  if (data.soilHumi < cfg.soilHumiLow)      pumpState = true;
+  if (data.soilHumi < cfg.soilHumiLow)       pumpState = true;
   else if (data.soilHumi > cfg.soilHumiHigh) pumpState = false;
 
+  // LIGHT KHONG THAM GIA AUTO
   applyOutputs();
 }
 
@@ -673,6 +823,7 @@ void enterManualMenu()
   uiState = UI_MANUAL_MENU;
   manualMenuIndex = MAN_HEATER;
   controlMode = MODE_MANUAL;
+  sendModeToSerial();
   displayManualMenu();
 }
 
@@ -704,12 +855,21 @@ void handleMainMenuButtons()
     if (mainMenuIndex == MAIN_AUTO)
     {
       controlMode = MODE_AUTO;
+      sendModeToSerial();
+
       if (hasValidData) controlOutputsAuto(currentData);
       else turnOffAllOutputs();
+
       enterHome();
     }
-    else if (mainMenuIndex == MAIN_MANUAL) { enterManualMenu(); }
-    else if (mainMenuIndex == MAIN_SETTINGS) { enterSettingsMenu(); }
+    else if (mainMenuIndex == MAIN_MANUAL)
+    {
+      enterManualMenu();
+    }
+    else if (mainMenuIndex == MAIN_SETTINGS)
+    {
+      enterSettingsMenu();
+    }
   }
 }
 
@@ -727,30 +887,28 @@ void increaseSetting()
       break;
     case SET_AIR_HUMI_LOW:
       cfg.airHumiLow += 1.0;
-      if (cfg.airHumiLow > 100.0) cfg.airHumiLow = 100.0;
       if (cfg.airHumiLow >= cfg.airHumiHigh) cfg.airHumiLow = cfg.airHumiHigh - 1.0;
       break;
     case SET_AIR_HUMI_HIGH:
       cfg.airHumiHigh += 1.0;
-      if (cfg.airHumiHigh > 100.0) cfg.airHumiHigh = 100.0;
       if (cfg.airHumiHigh <= cfg.airHumiLow) cfg.airHumiHigh = cfg.airHumiLow + 1.0;
       break;
     case SET_SOIL_HUMI_LOW:
       cfg.soilHumiLow += 1.0;
-      if (cfg.soilHumiLow > 100.0) cfg.soilHumiLow = 100.0;
       if (cfg.soilHumiLow >= cfg.soilHumiHigh) cfg.soilHumiLow = cfg.soilHumiHigh - 1.0;
       break;
     case SET_SOIL_HUMI_HIGH:
       cfg.soilHumiHigh += 1.0;
-      if (cfg.soilHumiHigh > 100.0) cfg.soilHumiHigh = 100.0;
       if (cfg.soilHumiHigh <= cfg.soilHumiLow) cfg.soilHumiHigh = cfg.soilHumiLow + 1.0;
       break;
     case SET_SAVE_EXIT:
-      saveSettings();  // ★ Sẽ tự gửi CFG lên web
+      saveSettings();
       if (controlMode == MODE_AUTO && hasValidData) controlOutputsAuto(currentData);
       enterHome();
       return;
   }
+
+  validateSettings(cfg);
   displaySettingsMenu();
 }
 
@@ -760,36 +918,32 @@ void decreaseSetting()
   {
     case SET_TEMP_LOW:
       cfg.tempLow -= 0.5;
-      if (cfg.tempLow < 0.0) cfg.tempLow = 0.0;
       if (cfg.tempLow >= cfg.tempHigh) cfg.tempLow = cfg.tempHigh - 0.5;
       break;
     case SET_TEMP_HIGH:
       cfg.tempHigh -= 0.5;
-      if (cfg.tempHigh < 0.5) cfg.tempHigh = 0.5;
       if (cfg.tempHigh <= cfg.tempLow) cfg.tempHigh = cfg.tempLow + 0.5;
       break;
     case SET_AIR_HUMI_LOW:
       cfg.airHumiLow -= 1.0;
-      if (cfg.airHumiLow < 0.0) cfg.airHumiLow = 0.0;
       break;
     case SET_AIR_HUMI_HIGH:
       cfg.airHumiHigh -= 1.0;
-      if (cfg.airHumiHigh < 1.0) cfg.airHumiHigh = 1.0;
       if (cfg.airHumiHigh <= cfg.airHumiLow) cfg.airHumiHigh = cfg.airHumiLow + 1.0;
       break;
     case SET_SOIL_HUMI_LOW:
       cfg.soilHumiLow -= 1.0;
-      if (cfg.soilHumiLow < 0.0) cfg.soilHumiLow = 0.0;
       break;
     case SET_SOIL_HUMI_HIGH:
       cfg.soilHumiHigh -= 1.0;
-      if (cfg.soilHumiHigh < 1.0) cfg.soilHumiHigh = 1.0;
       if (cfg.soilHumiHigh <= cfg.soilHumiLow) cfg.soilHumiHigh = cfg.soilHumiLow + 1.0;
       break;
     case SET_SAVE_EXIT:
       enterHome();
       return;
   }
+
+  validateSettings(cfg);
   displaySettingsMenu();
 }
 
@@ -818,10 +972,11 @@ void handleManualButtons()
   {
     switch (manualMenuIndex)
     {
-      case MAN_HEATER: heaterState = true; applyOutputs(); break;
-      case MAN_FAN:    fanState    = true; applyOutputs(); break;
-      case MAN_PUMP:   pumpState   = true; applyOutputs(); break;
-      case MAN_MIST:   mistState   = true; applyOutputs(); break;
+      case MAN_HEATER: heaterState = true;  applyOutputs(); break;
+      case MAN_FAN:    fanState    = true;  applyOutputs(); break;
+      case MAN_PUMP:   pumpState   = true;  applyOutputs(); break;
+      case MAN_MIST:   mistState   = true;  applyOutputs(); break;
+      case MAN_LIGHT:  lightState  = true;  applyOutputs(); break;
       case MAN_EXIT:   enterHome(); return;
     }
     displayManualMenu();
@@ -835,6 +990,7 @@ void handleManualButtons()
       case MAN_FAN:    fanState    = false; applyOutputs(); break;
       case MAN_PUMP:   pumpState   = false; applyOutputs(); break;
       case MAN_MIST:   mistState   = false; applyOutputs(); break;
+      case MAN_LIGHT:  lightState  = false; applyOutputs(); break;
       case MAN_EXIT:   displayManualMenu(); return;
     }
     displayManualMenu();
@@ -889,7 +1045,6 @@ void handleLoRaChar(char c)
       hasValidData = true;
       lastNodeTime = millis();
 
-      // ★ Print data cho serial_bridge.py đọc
       Serial.println("===== DATA NODE =====");
       Serial.print("Air Temp: "); Serial.println(currentData.airTemp);
       Serial.print("Air Humi: "); Serial.println(currentData.airHumi);
@@ -913,6 +1068,11 @@ void handleLoRaChar(char c)
         updateHomeDisplay();
       }
     }
+    else
+    {
+      Serial.println(">> Invalid sensor packet");
+    }
+
     resetLoRaBuffer();
   }
 }
@@ -928,6 +1088,7 @@ void setupPins()
   pinMode(RELAY_FAN, OUTPUT);
   pinMode(RELAY_PUMP, OUTPUT);
   pinMode(RELAY_MIST, OUTPUT);
+  pinMode(RELAY_LIGHT, OUTPUT);
 
   turnOffAllOutputs();
 }
@@ -946,19 +1107,19 @@ void setup()
   lcd.backlight();
 
   lcd.clear();
-  lcd.setCursor(0, 0); lcd.print("LoRa Gateway");
-  lcd.setCursor(0, 1); lcd.print("3 Buttons Control");
-  lcd.setCursor(0, 2); lcd.print("Web Sync Ready");
-  lcd.setCursor(0, 3); lcd.print("MODE: Menu");
+  lcd.setCursor(0, 0); lcd.print("NHA KINH THONG MINH");
+  lcd.setCursor(0, 1); lcd.print("DH SPKT HUNG YEN");
+
 
   LORA.begin(LORA_BAUD, SERIAL_8N1, LORA_RX, LORA_TX, false, 256);
   resetLoRaBuffer();
   memset(serialCmdBuffer, 0, sizeof(serialCmdBuffer));
 
-  delay(1200);
+  delay(5000);
 
-  // ★ Gửi settings hiện tại → sync web khi khởi động
   sendSettingsToSerial();
+  sendRelayStatesToSerial();
+  sendModeToSerial();
   Serial.println("=== READY ===");
 
   enterHome();
@@ -967,8 +1128,6 @@ void setup()
 void loop()
 {
   handleButtons();
-
-  // ★ Đọc lệnh từ Serial (serial_bridge.py gửi xuống)
   readSerialCommands();
 
   if (LORA.available() > 0)

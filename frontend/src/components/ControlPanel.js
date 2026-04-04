@@ -5,15 +5,16 @@ import { useState, useEffect } from "react";
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 const RELAYS = [
-  { key: "heater", label: "Sưởi", icon: "🔥", color: "#ef4444", description: "Điều khiển máy sưởi" },
-  { key: "fan", label: "Quạt", icon: "🌀", color: "#06b6d4", description: "Điều khiển quạt thông gió" },
-  { key: "pump", label: "Bơm", icon: "💧", color: "#3b82f6", description: "Điều khiển máy bơm tưới" },
-  { key: "mist", label: "Phun sương", icon: "🌫️", color: "#a855f7", description: "Điều khiển phun sương" },
-  { key: "light", label: "Đèn", icon: "💡", color: "#f59e0b", description: "Điều khiển đèn chiếu sáng" },
+  { key: "heater", label: "Sưởi", icon: "🔥", color: "#ef4444", description: "Điều khiển máy sưởi", autoControlled: true },
+  { key: "fan", label: "Quạt", icon: "🌀", color: "#06b6d4", description: "Điều khiển quạt thông gió", autoControlled: true },
+  { key: "pump", label: "Bơm", icon: "💧", color: "#3b82f6", description: "Điều khiển máy bơm tưới", autoControlled: true },
+  { key: "mist", label: "Phun sương", icon: "🌫️", color: "#a855f7", description: "Điều khiển phun sương", autoControlled: true },
+  { key: "light", label: "Đèn", icon: "💡", color: "#f59e0b", description: "Điều khiển đèn chiếu sáng", autoControlled: false },
 ];
 
 const RELAY_LABELS = { heater: "Sưởi", fan: "Quạt", pump: "Bơm", mist: "Phun sương", light: "Đèn" };
 
+// ★ Bỏ nhóm "Ánh sáng → Đèn" — Đèn không tham gia auto control (firmware ESP32)
 const THRESHOLD_CONFIG = [
   { group: "🌡️ Nhiệt độ không khí → Sưởi / Quạt", items: [
     { key: "temp_low", label: "Dưới ngưỡng → Bật Sưởi", unit: "°C", step: 0.5, min: 0, max: 50 },
@@ -26,10 +27,6 @@ const THRESHOLD_CONFIG = [
   { group: "🌱 Độ ẩm đất → Bơm nước", items: [
     { key: "soil_humi_low", label: "Dưới ngưỡng → Bật Bơm", unit: "%", step: 1, min: 0, max: 100 },
     { key: "soil_humi_high", label: "Trên ngưỡng → Tắt Bơm", unit: "%", step: 1, min: 0, max: 100 },
-  ]},
-  { group: "☀️ Ánh sáng → Đèn", items: [
-    { key: "light_low", label: "Dưới ngưỡng → Bật Đèn", unit: "lux", step: 500, min: 0, max: 100000 },
-    { key: "light_high", label: "Trên ngưỡng → Tắt Đèn", unit: "lux", step: 500, min: 0, max: 100000 },
   ]},
 ];
 
@@ -159,7 +156,7 @@ export default function ControlPanel() {
             </div>
             <div className="auto-mode-desc">
               {autoMode
-                ? "Hệ thống tự bật/tắt thiết bị dựa trên cảm biến"
+                ? "ESP32 tự bật/tắt thiết bị dựa trên cảm biến"
                 : "Bạn điều khiển bằng tay các thiết bị"}
             </div>
           </div>
@@ -201,6 +198,17 @@ export default function ControlPanel() {
             </div>
 
             <div className="threshold-modal-body">
+              <div className="threshold-note" style={{
+                padding: "8px 12px",
+                marginBottom: "12px",
+                background: "rgba(245, 158, 11, 0.1)",
+                border: "1px solid rgba(245, 158, 11, 0.3)",
+                borderRadius: "8px",
+                fontSize: "12px",
+                color: "#f59e0b"
+              }}>
+                💡 Đèn không tham gia tự động — chỉ điều khiển thủ công
+              </div>
               {THRESHOLD_CONFIG.map((group) => (
                 <div key={group.group} className="threshold-group">
                   <div className="threshold-group-title">{group.group}</div>
@@ -250,11 +258,13 @@ export default function ControlPanel() {
         {RELAYS.map((relay) => {
           const isOn = relayStates[relay.key];
           const isLoading = loading[relay.key];
+          // ★ Đèn luôn cho phép điều khiển tay (không bị disable khi auto mode)
+          const isDisabledByAuto = autoMode && relay.autoControlled;
 
           return (
             <div
               key={relay.key}
-              className={`control-card ${isOn ? "control-on" : "control-off"} ${autoMode ? "auto-controlled" : ""}`}
+              className={`control-card ${isOn ? "control-on" : "control-off"} ${isDisabledByAuto ? "auto-controlled" : ""}`}
               style={{ "--relay-color": relay.color }}
             >
               <div className="control-card-header">
@@ -263,7 +273,11 @@ export default function ControlPanel() {
                   <div>
                     <div className="control-label">{relay.label}</div>
                     <div className="control-desc">
-                      {autoMode ? "Tự động" : relay.description}
+                      {isDisabledByAuto
+                        ? "Tự động"
+                        : !relay.autoControlled
+                          ? "Chỉ thủ công"
+                          : relay.description}
                     </div>
                   </div>
                 </div>
@@ -273,7 +287,7 @@ export default function ControlPanel() {
               <button
                 className={`control-toggle ${isOn ? "toggle-on" : "toggle-off"}`}
                 onClick={() => toggleRelay(relay.key)}
-                disabled={isLoading || autoMode}
+                disabled={isLoading || isDisabledByAuto}
                 id={`relay-${relay.key}`}
               >
                 {isLoading ? (

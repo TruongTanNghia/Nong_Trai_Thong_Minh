@@ -1,9 +1,12 @@
 """
-Serial Bridge v3: ESP32 ↔ Web bidirectional sync
+Serial Bridge v4: ESP32 ↔ Web bidirectional sync
   1. Đọc data từ ESP32 qua Serial → gửi HTTP POST lên FastAPI backend
   2. Poll backend cho relay commands → gửi xuống ESP32 qua Serial
-  3. ★ Đọc CFG từ ESP32 → POST lên /api/auto/thresholds (ESP32 → Web)
-  4. ★ Poll settings commands → gửi CFG xuống ESP32 (Web → ESP32)
+  3. Đọc CFG từ ESP32 → POST lên /api/auto/thresholds (ESP32 → Web)
+  4. Poll settings commands → gửi CFG xuống ESP32 (Web → ESP32)
+  5. ★ Đọc MODE từ ESP32 → POST lên /api/mode/sync-from-device
+  6. ★ Poll mode commands → gửi MODE xuống ESP32 (Web → ESP32)
+  7. ★ Startup sync: GET:MODE, GET:CFG, GET:RELAY
 
 Cách dùng:
   python serial_bridge.py          (tự tìm COM port)
@@ -98,7 +101,7 @@ def parse_cfg_line(line):
 
 # ★ Parse RELAY_STATE line from ESP32 → POST to backend
 def parse_relay_state_line(line):
-    """Parse RELAY_STATE:heater=1,fan=0,pump=0,mist=0 from ESP32."""
+    """Parse RELAY_STATE:heater=1,fan=0,pump=0,mist=0,light=0 from ESP32."""
     state_str = line[len("RELAY_STATE:"):]
     states = {}
 
@@ -112,6 +115,16 @@ def parse_relay_state_line(line):
                 pass
 
     return states if states else None
+
+
+# ★ Parse MODE line from ESP32 → POST to backend
+def parse_mode_line(line):
+    """Parse MODE:AUTO or MODE:MANUAL from ESP32."""
+    mode_str = line[5:]  # skip "MODE:"
+    mode_str = mode_str.strip().upper()
+    if mode_str in ("AUTO", "MANUAL"):
+        return mode_str
+    return None
 
 
 def send_relay_state_to_server(states):
@@ -143,6 +156,25 @@ def send_cfg_to_server(thresholds):
         print(f"   ❌ Lỗi: {e}")
 
 
+# ★ Gửi mode từ ESP32 lên backend
+def send_mode_to_server(mode):
+    """POST mode (AUTO/MANUAL) từ ESP32 lên backend."""
+    try:
+        response = requests.post(
+            f"{API_URL}/api/mode/sync-from-device",
+            json={"mode": mode},
+            timeout=5
+        )
+        if response.status_code == 200:
+            print(f"   ✅ Đồng bộ mode ESP32 → Web: {mode}")
+        else:
+            print(f"   ❌ Lỗi sync mode: HTTP {response.status_code}")
+    except requests.exceptions.ConnectionError:
+        print("   ⚠️ Không kết nối được backend!")
+    except Exception as e:
+        print(f"   ❌ Lỗi: {e}")
+
+
 def send_to_server(data):
     """Gửi sensor data lên FastAPI backend."""
     try:
@@ -158,7 +190,7 @@ def send_to_server(data):
 
 
 def relay_command_poller(ser, stop_event):
-    """Thread: Poll backend cho relay commands + settings commands → gửi xuống ESP32."""
+    """Thread: Poll backend cho relay commands + settings commands + mode commands → gửi xuống ESP32."""
     relay_name_map = {
         "heater": "HEATER",
         "fan": "FAN",
@@ -205,6 +237,14 @@ def relay_command_poller(ser, stop_event):
                             cfg_cmd = "CFG:" + ",".join(parts) + "\n"
                             ser.write(cfg_cmd.encode())
                             print(f"   ⚙️ Gửi ngưỡng → ESP32: {cfg_cmd.strip()}")
+                    
+                    elif cmd_type == "mode_command":
+                        # ★ Web → ESP32: gửi lệnh chuyển mode
+                        mode = cmd.get("mode", "")
+                        if mode in ("AUTO", "MANUAL"):
+                            mode_cmd = f"MODE:{mode}\n"
+                            ser.write(mode_cmd.encode())
+                            print(f"   🔄 Gửi mode → ESP32: {mode_cmd.strip()}")
 
         except requests.exceptions.ConnectionError:
             pass
@@ -212,6 +252,22 @@ def relay_command_poller(ser, stop_event):
             print(f"   ⚠️ Relay poll error: {e}")
 
         stop_event.wait(RELAY_POLL_INTERVAL)
+
+
+# ★ Startup sync: query current state from ESP32
+def startup_sync(ser):
+    """Gửi GET commands để đồng bộ trạng thái ban đầu từ ESP32."""
+    print("🔄 Startup sync: querying ESP32 state...")
+    time.sleep(1)  # Chờ ESP32 sẵn sàng
+    
+    queries = ["GET:MODE\n", "GET:CFG\n", "GET:RELAY\n"]
+    for q in queries:
+        try:
+            ser.write(q.encode())
+            print(f"   📤 Sent: {q.strip()}")
+            time.sleep(0.3)  # Chờ ESP32 phản hồi
+        except Exception as e:
+            print(f"   ⚠️ Lỗi gửi {q.strip()}: {e}")
 
 
 def main():
@@ -230,6 +286,7 @@ def main():
     print(f"🌐 Backend: {API_URL}")
     print(f"🎛️ Relay command polling: mỗi {RELAY_POLL_INTERVAL}s")
     print(f"⚙️ Threshold sync: ESP32 ↔ Web bidirectional")
+    print(f"🔄 Mode sync: ESP32 ↔ Web bidirectional")
     print(f"   Nhấn Ctrl+C để dừng\n")
 
     try:
@@ -240,11 +297,14 @@ def main():
         print("   Tắt Serial Monitor trong Arduino IDE trước khi chạy script này!")
         return
 
+    # ★ Startup sync: query ESP32 state
+    startup_sync(ser)
+
     # Start relay command poller thread
     stop_event = threading.Event()
     relay_thread = threading.Thread(target=relay_command_poller, args=(ser, stop_event), daemon=True)
     relay_thread.start()
-    print("🎛️ Relay + Settings command thread started.\n")
+    print("🎛️ Relay + Settings + Mode command thread started.\n")
 
     buffer = []
     count = 0
@@ -275,6 +335,19 @@ def main():
                         print(f"\n🏛️ ESP32 relay thay đổi:")
                         send_relay_state_to_server(states)
                         print()
+                    continue
+
+                # ★ Handle MODE from ESP32
+                if line.startswith("MODE:"):
+                    mode = parse_mode_line(line)
+                    if mode:
+                        print(f"\n🔄 ESP32 mode thay đổi:")
+                        send_mode_to_server(mode)
+                        print()
+                    continue
+
+                # ★ Bỏ qua info messages từ ESP32
+                if line.startswith(">>"):
                     continue
 
                 if "DATA NODE" in line:
