@@ -181,6 +181,33 @@ async def esp32_upload(data: dict):
 
     device_id = data.get("device_id", "unknown")
     has_valid = data.get("hasValidData", False)
+    mode_str = data.get("mode", "AUTO")
+    esp_ip = data.get("ip", "")
+    rssi = data.get("wifi_rssi", 0)
+
+    # ★ LOG: Hiển thị rõ ESP32 đã kết nối
+    if not esp32_device_info:
+        print("")
+        print("═" * 50)
+        print("🟢 ESP32 ĐÃ KẾT NỐI THÀNH CÔNG!")
+        print(f"   📡 Device: {device_id}")
+        print(f"   🌐 IP ESP32: {esp_ip}")
+        print(f"   📶 WiFi RSSI: {rssi} dBm")
+        print(f"   🔄 Mode: {mode_str}")
+        print("═" * 50)
+        print("")
+
+    # ★ LOG: Hiển thị data mỗi lần upload
+    if has_valid:
+        print(f"📡 [{datetime.now().strftime('%H:%M:%S')}] ESP32 → "
+              f"T:{data.get('airTemp')}°C  "
+              f"H:{data.get('airHumi')}%  "
+              f"Soil:{data.get('soilHumi')}%  "
+              f"pH:{data.get('ph')}  "
+              f"Mode:{mode_str}  "
+              f"RSSI:{rssi}dBm")
+    else:
+        print(f"📡 [{datetime.now().strftime('%H:%M:%S')}] ESP32 → Chờ data sensor...")
 
     # ── 1. Cập nhật sensor data ──
     if has_valid:
@@ -198,7 +225,6 @@ async def esp32_upload(data: dict):
             "timestamp": datetime.now().isoformat(),
         }
         latest_data = sensor_data
-        # Broadcast sensor data to frontend via WebSocket
         await manager.broadcast(sensor_data)
 
     # ── 2. Cập nhật relay states từ ESP32 (source of truth) ──
@@ -207,12 +233,9 @@ async def esp32_upload(data: dict):
     relay_states["pump"] = bool(data.get("pump", False))
     relay_states["mist"] = bool(data.get("mist", False))
     relay_states["light"] = bool(data.get("light", False))
-
-    # Broadcast relay states to frontend
     await manager.broadcast({"type": "relay_states", "states": relay_states})
 
     # ── 3. Cập nhật mode từ ESP32 ──
-    mode_str = data.get("mode", "AUTO")
     auto_mode = (mode_str == "AUTO")
     await manager.broadcast({"type": "auto_mode", "enabled": auto_mode})
 
@@ -228,8 +251,8 @@ async def esp32_upload(data: dict):
     # ── 5. Lưu device info ──
     esp32_device_info = {
         "device_id": device_id,
-        "ip": data.get("ip", ""),
-        "wifi_rssi": data.get("wifi_rssi", 0),
+        "ip": esp_ip,
+        "wifi_rssi": rssi,
         "mode": mode_str,
         "last_seen": datetime.now().isoformat(),
     }
