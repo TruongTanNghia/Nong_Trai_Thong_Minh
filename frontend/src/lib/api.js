@@ -15,3 +15,52 @@ const getWsUrl = () => {
 
 export const API_URL = process.env.NEXT_PUBLIC_API_URL || getApiUrl();
 export const WS_URL = process.env.NEXT_PUBLIC_WS_URL || getWsUrl();
+
+// AI Analysis — gọi backend phân tích dữ liệu cảm biến
+export async function analyzeData(sensorData) {
+  const res = await fetch(`${API_URL}/api/analysis`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sensor_data: sensorData }),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return await res.json();
+}
+
+// ─── Zalo Config ─────────────────────────────────────────
+
+export async function fetchZaloConfig() {
+  const res = await fetch(`${API_URL}/api/zalo/config`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return await res.json();
+}
+
+export async function saveZaloConfig(botToken, chatId, sendInterval) {
+  const res = await fetch(`${API_URL}/api/zalo/config`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ bot_token: botToken, chat_id: chatId, send_interval: sendInterval }),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return await res.json();
+}
+
+export async function fetchZaloId(botToken) {
+  const res = await fetch(`${API_URL}/api/zalo/fetch-id`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ bot_token: botToken }),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return await res.json();
+}
+
+export async function toggleZaloAuto(autoSend) {
+  const res = await fetch(`${API_URL}/api/zalo/toggle`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ auto_send: autoSend }),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return await res.json();
+}
