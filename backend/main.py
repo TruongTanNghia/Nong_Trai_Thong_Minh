@@ -1,12 +1,14 @@
 """
-FastAPI Backend - Real-time Sensor Monitoring & AI Analysis
-No database - in-memory latest values + WebSocket broadcast
-★ v2: Mode sync with ESP32, light excluded from auto control
+FastAPI Backend v3 - Real-time Sensor Monitoring & AI Analysis
+★ ESP32 giao tiếp trực tiếp qua WiFi HTTP (không cần serial_bridge.py)
+  - POST /api/esp32/upload : ESP32 push toàn bộ data mỗi 3s
+  - GET  /api/esp32/command: ESP32 poll lệnh từ web mỗi 1s
 """
 
 import os
 import json
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
 
@@ -40,7 +42,7 @@ class SensorDataWithTimestamp(SensorData):
 
 
 class AnalysisRequest(BaseModel):
-    sensor_data: Optional[SensorData] = None  # If None, use latest
+    sensor_data: Optional[SensorData] = None
 
 
 class AnalysisResponse(BaseModel):
@@ -50,7 +52,7 @@ class AnalysisResponse(BaseModel):
 
 class RelayCommand(BaseModel):
     relay: str  # heater, fan, pump, mist, light
-    state: bool  # True = ON, False = OFF
+    state: bool
 
 
 # ─── WebSocket Manager ───────────────────────────────────────────
@@ -64,7 +66,8 @@ class ConnectionManager:
         self.active_connections.append(websocket)
 
     def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
 
     async def broadcast(self, data: dict):
         disconnected = []
@@ -74,15 +77,22 @@ class ConnectionManager:
             except Exception:
                 disconnected.append(connection)
         for conn in disconnected:
-            self.active_connections.remove(conn)
+            if conn in self.active_connections:
+                self.active_connections.remove(conn)
 
 
 # ─── App Setup ───────────────────────────────────────────────────
 
+@asynccontextmanager
+async def lifespan(app):
+    asyncio.create_task(zalo_periodic_task())
+    yield
+
 app = FastAPI(
     title="Sensor Monitoring API",
     description="Real-time agricultural sensor monitoring with AI analysis",
-    version="2.0.0"
+    version="3.0.0",
+    lifespan=lifespan
 )
 
 app.add_middleware(
@@ -95,10 +105,12 @@ app.add_middleware(
 
 manager = ConnectionManager()
 
-# In-memory storage for latest sensor data
+# ─── In-Memory State ─────────────────────────────────────────────
+
+# Sensor data (latest)
 latest_data: dict = {}
 
-# In-memory relay states
+# Relay states (ESP32 → Web, source of truth from ESP32)
 relay_states: dict = {
     "heater": False,
     "fan": False,
@@ -107,183 +119,178 @@ relay_states: dict = {
     "light": False,
 }
 
-# Queue for relay commands to send to ESP32 via serial bridge
-relay_command_queue: list = []
+# Auto mode (synced from ESP32)
+auto_mode: bool = True  # ESP32 mặc định AUTO
 
-# ─── Auto Control ────────────────────────────────────────────────
-
-auto_mode: bool = False
-
-# ★ Bỏ light_low / light_high — Đèn KHÔNG tham gia auto control (theo firmware mới)
+# Thresholds (synced from ESP32)
 auto_thresholds: dict = {
-    # Nhiệt độ không khí → Sưởi / Quạt
-    "temp_low": 20.0,       # Dưới → bật Sưởi
-    "temp_high": 30.0,      # Trên → bật Quạt
-    # Độ ẩm không khí → Phun sương
-    "air_humi_low": 60.0,   # Dưới → bật Phun sương
-    "air_humi_high": 80.0,  # Trên → tắt Phun sương
-    # Độ ẩm đất → Bơm
-    "soil_humi_low": 30.0,  # Dưới → bật Bơm
-    "soil_humi_high": 60.0, # Trên → tắt Bơm
+    "temp_low": 20.0,
+    "temp_high": 30.0,
+    "air_humi_low": 60.0,
+    "air_humi_high": 80.0,
+    "soil_humi_low": 30.0,
+    "soil_humi_high": 60.0,
 }
 
-auto_control_log: list = []  # Recent auto actions
+auto_control_log: list = []
+
+# ★ ESP32 WiFi direct — command queue (merged dict)
+# Khi user thao tác trên web → ghi vào đây
+# ESP32 poll GET /api/esp32/command → lấy ra và xóa
+esp32_pending_commands: dict = {}
+
+# ★ ESP32 device info
+esp32_device_info: dict = {}
+
+# Legacy: relay_command_queue cho serial_bridge (backward compatible)
+relay_command_queue: list = []
 
 # ─── Zalo Settings ───────────────────────────────────────────────
 zalo_config = load_zalo_config()
+zalo_auto_send: bool = True
+zalo_send_interval: int = zalo_config.get("send_interval", 30)
 
-# Cờ để kiểm soát việc gửi tự động
-zalo_auto_send: bool = True  # Mặc định bật
-zalo_send_interval: int = zalo_config.get("send_interval", 30)  # Giây
-
-# ─── Zalo Background Task ────────────────────────────────────────
 
 async def zalo_periodic_task():
-    """Gửi dữ liệu lên Zalo định kỳ theo khoảng thời gian cấu hình."""
     while True:
         try:
             await asyncio.sleep(zalo_send_interval)
-            
             if not zalo_auto_send:
                 continue
-                
             token = zalo_config.get("bot_token")
             chat_id = zalo_config.get("chat_id")
-            
             if token and chat_id and latest_data:
                 msg = format_sensor_message(latest_data)
                 await asyncio.to_thread(send_zalo_text, token, chat_id, msg)
-                
         except Exception as e:
-            print(f"⚠️ Lỗi trong zalo_periodic_task: {e}")
-
-@app.on_event("startup")
-async def startup_event():
-    # Khởi chạy Zalo task ngầm
-    asyncio.create_task(zalo_periodic_task())
+            print(f"⚠️ Lỗi zalo_periodic_task: {e}")
 
 
-# ★ Auto control — match firmware mới: bỏ light, thêm else tắt cả heater+fan
-async def auto_control_check(data: dict):
-    """Tự động bật/tắt relay dựa trên ngưỡng cảm biến (mirror firmware ESP32)."""
-    global relay_states, auto_control_log
-    if not auto_mode:
-        return
+# ═══════════════════════════════════════════════════════════════════
+# ★★★ ESP32 WiFi Direct Endpoints (MỚI - thay thế serial_bridge)
+# ═══════════════════════════════════════════════════════════════════
 
-    changes = []
+@app.post("/api/esp32/upload")
+async def esp32_upload(data: dict):
+    """
+    ★ ESP32 gửi TOÀN BỘ state lên đây mỗi 3 giây qua WiFi HTTP.
+    Payload bao gồm: sensor data + relay states + mode + settings + wifi info.
+    ESP32 là master — backend chỉ nhận và hiển thị.
+    """
+    global latest_data, relay_states, auto_mode, auto_thresholds, esp32_device_info
 
-    # Nhiệt độ → Sưởi / Quạt (match firmware: else tắt cả 2)
-    air_temp = data.get("air_temperature")
-    if air_temp is not None:
-        if air_temp < auto_thresholds["temp_low"]:
-            if not relay_states["heater"]:
-                relay_states["heater"] = True
-                changes.append({"relay": "heater", "state": True, "reason": f"Nhiệt độ thấp ({air_temp}°C < {auto_thresholds['temp_low']}°C)"})
-            if relay_states["fan"]:
-                relay_states["fan"] = False
-                changes.append({"relay": "fan", "state": False, "reason": f"Tắt quạt vì đang lạnh"})
-        elif air_temp > auto_thresholds["temp_high"]:
-            if not relay_states["fan"]:
-                relay_states["fan"] = True
-                changes.append({"relay": "fan", "state": True, "reason": f"Nhiệt độ cao ({air_temp}°C > {auto_thresholds['temp_high']}°C)"})
-            if relay_states["heater"]:
-                relay_states["heater"] = False
-                changes.append({"relay": "heater", "state": False, "reason": f"Tắt sưởi vì đang nóng"})
-        else:
-            # ★ Trong ngưỡng → tắt cả hai (match firmware mới)
-            if relay_states["heater"]:
-                relay_states["heater"] = False
-                changes.append({"relay": "heater", "state": False, "reason": f"Nhiệt độ bình thường ({air_temp}°C)"})
-            if relay_states["fan"]:
-                relay_states["fan"] = False
-                changes.append({"relay": "fan", "state": False, "reason": f"Nhiệt độ bình thường ({air_temp}°C)"})
+    device_id = data.get("device_id", "unknown")
+    has_valid = data.get("hasValidData", False)
 
-    # Độ ẩm không khí → Phun sương
-    air_humi = data.get("air_humidity")
-    if air_humi is not None:
-        if air_humi < auto_thresholds["air_humi_low"]:
-            if not relay_states["mist"]:
-                relay_states["mist"] = True
-                changes.append({"relay": "mist", "state": True, "reason": f"Độ ẩm KK thấp ({air_humi}% < {auto_thresholds['air_humi_low']}%)"})
-        elif air_humi > auto_thresholds["air_humi_high"]:
-            if relay_states["mist"]:
-                relay_states["mist"] = False
-                changes.append({"relay": "mist", "state": False, "reason": f"Độ ẩm KK cao ({air_humi}% > {auto_thresholds['air_humi_high']}%)"})
-
-    # Độ ẩm đất → Bơm
-    soil_humi = data.get("soil_moisture")
-    if soil_humi is not None:
-        if soil_humi < auto_thresholds["soil_humi_low"]:
-            if not relay_states["pump"]:
-                relay_states["pump"] = True
-                changes.append({"relay": "pump", "state": True, "reason": f"Đất khô ({soil_humi}% < {auto_thresholds['soil_humi_low']}%)"})
-        elif soil_humi > auto_thresholds["soil_humi_high"]:
-            if relay_states["pump"]:
-                relay_states["pump"] = False
-                changes.append({"relay": "pump", "state": False, "reason": f"Đất đủ ẩm ({soil_humi}% > {auto_thresholds['soil_humi_high']}%)"})
-
-    # ★ LIGHT KHÔNG THAM GIA AUTO CONTROL (match firmware ESP32)
-
-    # Broadcast changes
-    for change in changes:
-        command_msg = {
-            "type": "relay_command",
-            "relay": change["relay"],
-            "state": change["state"],
+    # ── 1. Cập nhật sensor data ──
+    if has_valid:
+        sensor_data = {
+            "air_temperature": data.get("airTemp"),
+            "air_humidity": data.get("airHumi"),
+            "soil_temperature": data.get("soilTemp"),
+            "soil_moisture": data.get("soilHumi"),
+            "salinity": data.get("salinity"),
+            "ec": data.get("ec"),
+            "nitrogen": data.get("nitrogen"),
+            "phosphorus": data.get("phosphorus"),
+            "potassium": data.get("potassium"),
+            "soil_ph": data.get("ph"),
+            "timestamp": datetime.now().isoformat(),
         }
-        await manager.broadcast(command_msg)
-        relay_command_queue.append(command_msg)
+        latest_data = sensor_data
+        # Broadcast sensor data to frontend via WebSocket
+        await manager.broadcast(sensor_data)
 
-        # Log
-        log_entry = {
-            "time": datetime.now().strftime("%H:%M:%S"),
-            "relay": change["relay"],
-            "state": change["state"],
-            "reason": change["reason"],
-        }
-        auto_control_log.append(log_entry)
-        # Giữ tối đa 50 log
-        if len(auto_control_log) > 50:
-            auto_control_log.pop(0)
+    # ── 2. Cập nhật relay states từ ESP32 (source of truth) ──
+    relay_states["heater"] = bool(data.get("heater", False))
+    relay_states["fan"] = bool(data.get("fan", False))
+    relay_states["pump"] = bool(data.get("pump", False))
+    relay_states["mist"] = bool(data.get("mist", False))
+    relay_states["light"] = bool(data.get("light", False))
 
-    # Broadcast relay states update
-    if changes:
-        await manager.broadcast({"type": "relay_update", "states": relay_states})
+    # Broadcast relay states to frontend
+    await manager.broadcast({"type": "relay_states", "states": relay_states})
+
+    # ── 3. Cập nhật mode từ ESP32 ──
+    mode_str = data.get("mode", "AUTO")
+    auto_mode = (mode_str == "AUTO")
+    await manager.broadcast({"type": "auto_mode", "enabled": auto_mode})
+
+    # ── 4. Cập nhật thresholds từ ESP32 ──
+    if data.get("tempLow") is not None:
+        auto_thresholds["temp_low"] = data.get("tempLow", 20.0)
+        auto_thresholds["temp_high"] = data.get("tempHigh", 30.0)
+        auto_thresholds["air_humi_low"] = data.get("airHumiLow", 60.0)
+        auto_thresholds["air_humi_high"] = data.get("airHumiHigh", 80.0)
+        auto_thresholds["soil_humi_low"] = data.get("soilHumiLow", 30.0)
+        auto_thresholds["soil_humi_high"] = data.get("soilHumiHigh", 60.0)
+
+    # ── 5. Lưu device info ──
+    esp32_device_info = {
+        "device_id": device_id,
+        "ip": data.get("ip", ""),
+        "wifi_rssi": data.get("wifi_rssi", 0),
+        "mode": mode_str,
+        "last_seen": datetime.now().isoformat(),
+    }
+
+    return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
 
-# ─── REST Endpoints ──────────────────────────────────────────────
+@app.get("/api/esp32/command")
+async def esp32_get_command(device_id: str = "esp32_gateway_01"):
+    """
+    ★ ESP32 poll endpoint này mỗi 1 giây để lấy lệnh từ web.
+    Trả về JSON object với các field tùy chọn:
+      - mode: "AUTO" | "MANUAL"
+      - heater/fan/pump/mist/light: true/false (chỉ áp dụng khi MANUAL)
+      - tempLow/tempHigh/airHumiLow/.../soilHumiHigh: float (cập nhật ngưỡng)
+    Trả rỗng {} nếu không có lệnh.
+    """
+    global esp32_pending_commands
+
+    if not esp32_pending_commands:
+        return {}
+
+    # Lấy và xóa queue
+    commands = dict(esp32_pending_commands)
+    esp32_pending_commands = {}
+
+    print(f"📤 Gửi command cho ESP32: {commands}")
+    return commands
+
+
+@app.get("/api/esp32/info")
+async def get_esp32_info():
+    """Thông tin ESP32 device (IP, WiFi RSSI, last seen, v.v.)."""
+    return esp32_device_info if esp32_device_info else {"status": "no_device"}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Legacy Endpoints (vẫn hoạt động cho serial_bridge + test_send_data)
+# ═══════════════════════════════════════════════════════════════════
 
 @app.get("/")
 async def root():
-    return {"status": "online", "message": "Sensor Monitoring API v2.0"}
+    return {"status": "online", "message": "Sensor Monitoring API v3.0 (WiFi Direct)"}
 
 
 @app.post("/api/sensor-data")
 async def receive_sensor_data(data: SensorData):
-    """
-    ESP32 pushes sensor readings here.
-    Data is stored in-memory and broadcast to all WebSocket clients.
-    """
+    """Legacy: serial_bridge hoặc test_send_data gửi data qua đây."""
     global latest_data
 
     timestamp = datetime.now().isoformat()
     data_dict = data.model_dump()
     data_dict["timestamp"] = timestamp
-
     latest_data = data_dict
 
-    # Broadcast to all connected WebSocket clients
     await manager.broadcast(data_dict)
-
-    # Auto-control check
-    await auto_control_check(data_dict)
-
     return {"status": "ok", "timestamp": timestamp}
 
 
 @app.get("/api/sensor-data/latest")
 async def get_latest_data():
-    """Get the most recent sensor reading."""
     if not latest_data:
         return {"status": "no_data", "message": "Chưa có dữ liệu cảm biến"}
     return latest_data
@@ -293,32 +300,29 @@ async def get_latest_data():
 
 @app.get("/api/auto/status")
 async def get_auto_status():
-    """Get auto-control mode status, thresholds, and recent log."""
     return {
         "enabled": auto_mode,
         "thresholds": auto_thresholds,
-        "log": auto_control_log[-20:],  # Last 20 entries
+        "log": auto_control_log[-20:],
     }
 
 
 @app.post("/api/auto/toggle")
 async def toggle_auto_mode():
-    """Toggle auto-control mode on/off. ★ Gửi lệnh MODE xuống ESP32."""
+    """Toggle auto/manual. ★ Queue lệnh MODE cho ESP32."""
     global auto_mode
     auto_mode = not auto_mode
 
-    # Broadcast mode change to WebSocket clients
     await manager.broadcast({"type": "auto_mode", "enabled": auto_mode})
 
-    # ★ Queue mode command cho serial bridge → gửi xuống ESP32
+    # ★ Queue cho ESP32 WiFi polling
+    esp32_pending_commands["mode"] = "AUTO" if auto_mode else "MANUAL"
+
+    # Legacy: queue cho serial_bridge
     relay_command_queue.append({
         "type": "mode_command",
         "mode": "AUTO" if auto_mode else "MANUAL",
     })
-
-    # Chạy auto-control ngay với data hiện tại khi bật
-    if auto_mode and latest_data:
-        await auto_control_check(latest_data)
 
     return {"enabled": auto_mode}
 
@@ -334,89 +338,67 @@ class AutoThresholds(BaseModel):
 
 @app.post("/api/auto/thresholds")
 async def update_thresholds(t: AutoThresholds):
-    """Update auto-control thresholds."""
+    """Cập nhật ngưỡng tự động. ★ Queue cho ESP32."""
     updates = t.model_dump(exclude_none=True)
     auto_thresholds.update(updates)
-    # Chạy auto-control ngay với ngưỡng mới
-    if auto_mode and latest_data:
-        await auto_control_check(latest_data)
-    # ★ Queue settings command để serial bridge gửi xuống ESP32
+
+    # ★ Queue cho ESP32 WiFi polling (dùng key name ESP32 hiểu)
+    key_map = {
+        "temp_low": "tempLow",
+        "temp_high": "tempHigh",
+        "air_humi_low": "airHumiLow",
+        "air_humi_high": "airHumiHigh",
+        "soil_humi_low": "soilHumiLow",
+        "soil_humi_high": "soilHumiHigh",
+    }
+    for api_key, esp_key in key_map.items():
+        if api_key in updates:
+            esp32_pending_commands[esp_key] = updates[api_key]
+
+    # Legacy: queue cho serial_bridge
     relay_command_queue.append({
         "type": "settings_command",
         "thresholds": dict(auto_thresholds),
     })
+
     return auto_thresholds
-
-
-# ─── Mode Sync ──────────────────────────────────────────────────
-
-class ModeSyncRequest(BaseModel):
-    mode: str  # "AUTO" or "MANUAL"
-
-
-@app.post("/api/mode/sync-from-device")
-async def sync_mode_from_device(req: ModeSyncRequest):
-    """★ ESP32 gửi mode lên (qua serial_bridge) → cập nhật web.
-    ESP32 là master, web hiển thị theo ESP32."""
-    global auto_mode
-
-    mode_upper = req.mode.upper()
-    if mode_upper not in ("AUTO", "MANUAL"):
-        raise HTTPException(status_code=400, detail=f"Invalid mode: {req.mode}. Must be AUTO or MANUAL")
-
-    auto_mode = (mode_upper == "AUTO")
-
-    # Broadcast mode change to all WS clients → frontend cập nhật ngay
-    await manager.broadcast({
-        "type": "auto_mode",
-        "enabled": auto_mode,
-    })
-
-    # Nếu chuyển sang AUTO, chạy auto control ngay
-    if auto_mode and latest_data:
-        await auto_control_check(latest_data)
-
-    return {"enabled": auto_mode, "mode": mode_upper}
 
 
 # ─── Relay Control ───────────────────────────────────────────────
 
 @app.get("/api/relay/status")
 async def get_relay_status():
-    """Get current relay states."""
     return relay_states
 
 
 @app.post("/api/relay/control")
 async def control_relay(cmd: RelayCommand):
-    """Toggle a relay on/off.
-    ★ ESP32 quyết định cuối cùng. Web chỉ gửi lệnh, ESP32 sẽ xác nhận hoặc từ chối.
-    Nếu ESP32 đang AUTO mode, lệnh relay sẽ bị ESP32 bỏ qua."""
+    """Toggle relay. ★ Queue cho ESP32. ESP32 quyết định cuối cùng."""
     valid_relays = ["heater", "fan", "pump", "mist", "light"]
     if cmd.relay not in valid_relays:
-        raise HTTPException(status_code=400, detail=f"Invalid relay: {cmd.relay}. Must be one of {valid_relays}")
+        raise HTTPException(status_code=400, detail=f"Invalid relay: {cmd.relay}")
 
-    # ★ Cập nhật relay state trên backend (optimistic update)
-    # ESP32 sẽ xác nhận qua RELAY_STATE nếu chấp nhận
+    # Optimistic update trên backend
     relay_states[cmd.relay] = cmd.state
 
-    # Broadcast relay command to all WS clients (including serial bridge)
-    command_msg = {
+    await manager.broadcast({"type": "relay_states", "states": relay_states})
+
+    # ★ Queue cho ESP32 WiFi polling
+    esp32_pending_commands[cmd.relay] = cmd.state
+
+    # Legacy: queue cho serial_bridge
+    relay_command_queue.append({
         "type": "relay_command",
         "relay": cmd.relay,
         "state": cmd.state,
-    }
-    await manager.broadcast(command_msg)
-
-    # Also queue for serial bridge polling
-    relay_command_queue.append(command_msg)
+    })
 
     return {"status": "ok", "relay": cmd.relay, "state": cmd.state}
 
 
 @app.get("/api/relay/pending")
 async def get_pending_commands():
-    """Serial bridge polls this to get pending relay + settings + mode commands."""
+    """Legacy: serial_bridge polls endpoint này."""
     global relay_command_queue
     commands = list(relay_command_queue)
     relay_command_queue = []
@@ -425,31 +407,42 @@ async def get_pending_commands():
 
 @app.post("/api/relay/sync-from-device")
 async def sync_relay_from_device(states: dict):
-    """★ ESP32 gửi trạng thái relay lên (qua serial_bridge) → cập nhật web.
-    ESP32 là master, đây là source of truth."""
+    """Legacy: serial_bridge gửi relay state từ ESP32."""
     valid_relays = ["heater", "fan", "pump", "mist", "light"]
     for key, val in states.items():
         if key in valid_relays:
             relay_states[key] = bool(val)
-
-    # Broadcast relay states to all WS clients → frontend cập nhật ngay
-    await manager.broadcast({
-        "type": "relay_states",
-        "states": relay_states,
-    })
+    await manager.broadcast({"type": "relay_states", "states": relay_states})
     return relay_states
 
 
-# ─── Zalo Config Endpoints ───────────────────────────────────────
+# ─── Mode Sync (legacy) ─────────────────────────────────────────
+
+class ModeSyncRequest(BaseModel):
+    mode: str
+
+
+@app.post("/api/mode/sync-from-device")
+async def sync_mode_from_device(req: ModeSyncRequest):
+    """Legacy: serial_bridge gửi mode từ ESP32."""
+    global auto_mode
+    mode_upper = req.mode.upper()
+    if mode_upper not in ("AUTO", "MANUAL"):
+        raise HTTPException(status_code=400, detail=f"Invalid mode: {req.mode}")
+    auto_mode = (mode_upper == "AUTO")
+    await manager.broadcast({"type": "auto_mode", "enabled": auto_mode})
+    return {"enabled": auto_mode, "mode": mode_upper}
+
+
+# ─── Zalo Config ─────────────────────────────────────────────────
 
 class ZaloConfigRequest(BaseModel):
     bot_token: str
     chat_id: str
-    send_interval: Optional[int] = None  # Giây, nếu None giữ nguyên
+    send_interval: Optional[int] = None
 
 @app.get("/api/zalo/config")
 async def get_zalo_config_endpoint():
-    """Lấy cấu hình Zalo hiện tại"""
     return {
         "bot_token": zalo_config.get("bot_token", ""),
         "chat_id": zalo_config.get("chat_id", ""),
@@ -459,7 +452,6 @@ async def get_zalo_config_endpoint():
 
 @app.post("/api/zalo/config")
 async def save_zalo_config_endpoint(req: ZaloConfigRequest):
-    """Lưu cấu hình Zalo"""
     global zalo_config, zalo_send_interval
     interval = req.send_interval if req.send_interval and req.send_interval >= 10 else zalo_send_interval
     if save_zalo_config(req.bot_token, req.chat_id, interval):
@@ -476,7 +468,6 @@ class ZaloFetchIdRequest(BaseModel):
 
 @app.post("/api/zalo/fetch-id")
 async def fetch_zalo_chat_id(req: ZaloFetchIdRequest):
-    """Lấy Chat ID tự động dựa trên Token"""
     chat_id, error = await asyncio.to_thread(fetch_chat_id_from_updates, req.bot_token)
     if error:
         raise HTTPException(status_code=400, detail=error)
@@ -487,7 +478,6 @@ class ZaloToggleRequest(BaseModel):
 
 @app.post("/api/zalo/toggle")
 async def toggle_zalo_auto_send(req: ZaloToggleRequest):
-    """Bật/tắt việc gửi tự động Zalo"""
     global zalo_auto_send
     zalo_auto_send = req.auto_send
     return {"status": "ok", "auto_send": zalo_auto_send}
@@ -497,9 +487,6 @@ async def toggle_zalo_auto_send(req: ZaloToggleRequest):
 
 @app.post("/api/analysis", response_model=AnalysisResponse)
 async def analyze_data(request: AnalysisRequest):
-    """
-    Use Google Gemini to analyze sensor data and provide recommendations.
-    """
     data = request.sensor_data.model_dump() if request.sensor_data else latest_data
 
     if not data:
@@ -507,7 +494,6 @@ async def analyze_data(request: AnalysisRequest):
 
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key or api_key == "your_gemini_api_key_here":
-        # Return mock analysis if no API key
         analysis_text = _generate_mock_analysis(data)
         return AnalysisResponse(
             analysis=analysis_text,
@@ -532,7 +518,6 @@ DỮ LIỆU CẢM BIẾN:
 - Độ mặn: {data.get('salinity', 'N/A')} mg/L
 - Nhiệt độ không khí: {data.get('air_temperature', 'N/A')}°C
 - Độ ẩm không khí: {data.get('air_humidity', 'N/A')}%
-- Cường độ ánh sáng: {data.get('light_intensity', 'N/A')} lux
 
 Hãy trả lời bằng tiếng Việt với format:
 1. 📊 ĐÁNH GIÁ TỔNG QUAN (tốt/trung bình/cần cải thiện)
@@ -543,7 +528,7 @@ Hãy trả lời bằng tiếng Việt với format:
 
         response = await asyncio.to_thread(
             client.models.generate_content,
-            model="gemini-3-flash-preview",
+            model="gemini-2.0-flash",
             contents=prompt,
         )
         analysis_text = response.text
@@ -558,7 +543,6 @@ Hãy trả lời bằng tiếng Việt với format:
 
 
 def _generate_mock_analysis(data: dict) -> str:
-    """Generate a basic analysis when Gemini API is not available."""
     warnings = []
     suggestions = []
 
@@ -611,7 +595,6 @@ def _generate_mock_analysis(data: dict) -> str:
         result += f"- {s}\n"
 
     result += "\n_⚡ Đây là phân tích cơ bản. Thêm GEMINI_API_KEY vào file .env để có phân tích AI chi tiết hơn._"
-
     return result
 
 
@@ -621,21 +604,16 @@ def _generate_mock_analysis(data: dict) -> str:
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
-        # Send latest data immediately on connect
+        # Gửi state hiện tại ngay khi connect
         if latest_data:
             await websocket.send_json(latest_data)
-
-        # ★ Send current mode + relay states on connect
         await websocket.send_json({"type": "auto_mode", "enabled": auto_mode})
         await websocket.send_json({"type": "relay_states", "states": relay_states})
 
-        # Keep connection alive, listen for client messages
         while True:
             try:
-                # Wait for any message from client (ping/pong keepalive)
                 await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
             except asyncio.TimeoutError:
-                # Send ping to keep alive
                 try:
                     await websocket.send_json({"type": "ping"})
                 except Exception:

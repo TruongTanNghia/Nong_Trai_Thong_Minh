@@ -3,6 +3,20 @@
 #include <Preferences.h>
 #include <stdlib.h>
 #include <string.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+//================ WIFI CONFIG =================
+const char* ssid = "Linh Kien GenZ";
+const char* password = "123456789";
+
+// DOI IP NAY THANH IP MAY TINH CHAY BACKEND
+const char* serverBase = "http://192.168.0.100:8000";
+
+// API
+const char* uploadEndpoint = "/api/esp32/upload";
+const char* commandEndpoint = "/api/esp32/command";
 
 //================ PIN CONFIG =================
 #define LORA_RX 26
@@ -35,10 +49,13 @@
 
 //================ TIMEOUT =================
 static const unsigned long NODE_TIMEOUT_MS = 15000;
+static const unsigned long WIFI_RETRY_MS = 10000;
+static const unsigned long UPLOAD_INTERVAL_MS = 3000;
+static const unsigned long FETCH_CMD_INTERVAL_MS = 1000;
 
 //================ BUFFER =================
 static const size_t LORA_BUFFER_SIZE = 128;
-static const size_t SERIAL_CMD_BUFFER_SIZE = 200;
+static const size_t JSON_DOC_SIZE = 1024;
 
 //================ OBJECTS =================
 HardwareSerial LORA(1);
@@ -64,10 +81,8 @@ struct Settings
 {
   float tempLow;
   float tempHigh;
-
   float airHumiLow;
   float airHumiHigh;
-
   float soilHumiLow;
   float soilHumiHigh;
 };
@@ -91,9 +106,6 @@ size_t loraIndex = 0;
 bool isReceivingPacket = false;
 bool hasValidData = false;
 unsigned long lastNodeTime = 0;
-
-char serialCmdBuffer[SERIAL_CMD_BUFFER_SIZE];
-size_t serialCmdIndex = 0;
 
 //================ OUTPUT STATE =================
 bool heaterState = false;
@@ -170,15 +182,36 @@ enum ManualMenuItem
 ManualMenuItem manualMenuIndex = MAN_HEATER;
 
 //================ BUTTON STATE =================
-bool lastModeReading = HIGH;
-bool lastUpReading   = HIGH;
-bool lastDownReading = HIGH;
+struct ButtonState
+{
+  uint8_t pin;
+  bool stableState;
+  bool lastReading;
+  unsigned long lastDebounceTime;
+};
 
-unsigned long lastModeMs = 0;
-unsigned long lastUpMs   = 0;
-unsigned long lastDownMs = 0;
+ButtonState btnMode = {BTN_MODE, HIGH, HIGH, 0};
+ButtonState btnUp   = {BTN_UP,   HIGH, HIGH, 0};
+ButtonState btnDown = {BTN_DOWN, HIGH, HIGH, 0};
 
-const unsigned long DEBOUNCE_MS = 30;
+const unsigned long DEBOUNCE_MS = 50;
+
+//================ WIFI TIMER =================
+unsigned long lastWiFiRetryMs = 0;
+unsigned long lastUploadMs = 0;
+unsigned long lastFetchCmdMs = 0;
+
+//================ FUNCTION PROTOTYPES =================
+void applyOutputs();
+void turnOffAllOutputs();
+void updateHomeDisplay();
+void displayMainMenu();
+void displaySettingsMenu();
+void displayManualMenu();
+void controlOutputsAuto(const SensorData& data);
+void validateSettings(Settings &s);
+void saveSettings();
+void enterHome();
 
 //================ UTIL =================
 void relayWrite(uint8_t pin, bool on)
@@ -247,34 +280,201 @@ void validateSettings(Settings &s)
   }
 }
 
-//================ SERIAL SYNC =================
-void sendRelayStatesToSerial()
+//================ WIFI =================
+void connectWiFi()
 {
-  Serial.print("RELAY_STATE:");
-  Serial.print("heater="); Serial.print(heaterState ? 1 : 0);
-  Serial.print(",fan=");   Serial.print(fanState ? 1 : 0);
-  Serial.print(",pump=");  Serial.print(pumpState ? 1 : 0);
-  Serial.print(",mist=");  Serial.print(mistState ? 1 : 0);
-  Serial.print(",light="); Serial.print(lightState ? 1 : 0);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  Serial.print("Dang ket noi WiFi");
+  unsigned long start = millis();
+
+  while (WiFi.status() != WL_CONNECTED && (millis() - start < 20000))
+  {
+    delay(500);
+    Serial.print(".");
+  }
+
   Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.println("=== WIFI CONNECTED ===");
+    Serial.print("IP ESP32: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("RSSI: ");
+    Serial.println(WiFi.RSSI());
+  }
+  else
+  {
+    Serial.println("=== WIFI CONNECT FAILED ===");
+    Serial.print("WiFi status = ");
+    Serial.println(WiFi.status());
+  }
 }
 
-void sendSettingsToSerial()
+void ensureWiFiConnected()
 {
-  Serial.print("CFG:");
-  Serial.print("tempLow="); Serial.print(cfg.tempLow, 1);
-  Serial.print(",tempHigh="); Serial.print(cfg.tempHigh, 1);
-  Serial.print(",airHumiLow="); Serial.print(cfg.airHumiLow, 1);
-  Serial.print(",airHumiHigh="); Serial.print(cfg.airHumiHigh, 1);
-  Serial.print(",soilHumiLow="); Serial.print(cfg.soilHumiLow, 1);
-  Serial.print(",soilHumiHigh="); Serial.print(cfg.soilHumiHigh, 1);
-  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  if (millis() - lastWiFiRetryMs < WIFI_RETRY_MS) return;
+  lastWiFiRetryMs = millis();
+
+  Serial.println("WiFi mat ket noi, reconnect...");
+  WiFi.disconnect(true, true);
+  delay(500);
+  WiFi.begin(ssid, password);
 }
 
-void sendModeToSerial()
+String modeToString()
 {
-  Serial.print("MODE:");
-  Serial.println(controlMode == MODE_AUTO ? "AUTO" : "MANUAL");
+  return (controlMode == MODE_AUTO) ? "AUTO" : "MANUAL";
+}
+
+//================ HTTP =================
+void uploadDataToServer()
+{
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  String url = String(serverBase) + String(uploadEndpoint);
+
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+
+  StaticJsonDocument<JSON_DOC_SIZE> doc;
+
+  doc["device_id"] = "esp32_gateway_01";
+  doc["hasValidData"] = hasValidData;
+  doc["mode"] = modeToString();
+
+  doc["airTemp"] = currentData.airTemp;
+  doc["airHumi"] = currentData.airHumi;
+  doc["soilTemp"] = currentData.soilTemp;
+  doc["soilHumi"] = currentData.soilHumi;
+  doc["salinity"] = currentData.salinity;
+  doc["ec"] = currentData.ec;
+  doc["nitrogen"] = currentData.nitrogen;
+  doc["phosphorus"] = currentData.phosphorus;
+  doc["potassium"] = currentData.potassium;
+  doc["ph"] = currentData.ph;
+
+  doc["heater"] = heaterState;
+  doc["fan"] = fanState;
+  doc["pump"] = pumpState;
+  doc["mist"] = mistState;
+  doc["light"] = lightState;
+
+  doc["tempLow"] = cfg.tempLow;
+  doc["tempHigh"] = cfg.tempHigh;
+  doc["airHumiLow"] = cfg.airHumiLow;
+  doc["airHumiHigh"] = cfg.airHumiHigh;
+  doc["soilHumiLow"] = cfg.soilHumiLow;
+  doc["soilHumiHigh"] = cfg.soilHumiHigh;
+
+  doc["wifi_rssi"] = WiFi.RSSI();
+  doc["ip"] = WiFi.localIP().toString();
+
+  String payload;
+  serializeJson(doc, payload);
+
+  int httpCode = http.POST(payload);
+  String response = http.getString();
+
+  Serial.print("[UPLOAD] HTTP code: ");
+  Serial.println(httpCode);
+  if (response.length() > 0)
+  {
+    Serial.print("[UPLOAD] Response: ");
+    Serial.println(response);
+  }
+
+  http.end();
+}
+
+void applySettingsFromJson(JsonDocument& doc)
+{
+  bool changed = false;
+
+  if (doc.containsKey("tempLow"))      { cfg.tempLow = doc["tempLow"]; changed = true; }
+  if (doc.containsKey("tempHigh"))     { cfg.tempHigh = doc["tempHigh"]; changed = true; }
+  if (doc.containsKey("airHumiLow"))   { cfg.airHumiLow = doc["airHumiLow"]; changed = true; }
+  if (doc.containsKey("airHumiHigh"))  { cfg.airHumiHigh = doc["airHumiHigh"]; changed = true; }
+  if (doc.containsKey("soilHumiLow"))  { cfg.soilHumiLow = doc["soilHumiLow"]; changed = true; }
+  if (doc.containsKey("soilHumiHigh")) { cfg.soilHumiHigh = doc["soilHumiHigh"]; changed = true; }
+
+  if (changed)
+  {
+    validateSettings(cfg);
+    saveSettings();
+    Serial.println("[CMD] Settings updated from server");
+  }
+}
+
+void fetchCommandFromServer()
+{
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  String url = String(serverBase) + String(commandEndpoint) + "?device_id=esp32_gateway_01";
+  http.begin(url);
+
+  int httpCode = http.GET();
+  if (httpCode <= 0)
+  {
+    Serial.print("[CMD] GET failed: ");
+    Serial.println(httpCode);
+    http.end();
+    return;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  if (payload.length() == 0) return;
+
+  StaticJsonDocument<JSON_DOC_SIZE> doc;
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err)
+  {
+    Serial.print("[CMD] JSON parse error: ");
+    Serial.println(err.c_str());
+    return;
+  }
+
+  if (doc.containsKey("mode"))
+  {
+    const char* mode = doc["mode"];
+
+    if (strcmp(mode, "AUTO") == 0)
+    {
+      controlMode = MODE_AUTO;
+      if (hasValidData) controlOutputsAuto(currentData);
+      else turnOffAllOutputs();
+    }
+    else if (strcmp(mode, "MANUAL") == 0)
+    {
+      controlMode = MODE_MANUAL;
+    }
+  }
+
+  applySettingsFromJson(doc);
+
+  if (controlMode == MODE_MANUAL)
+  {
+    if (doc.containsKey("heater")) heaterState = doc["heater"];
+    if (doc.containsKey("fan"))    fanState    = doc["fan"];
+    if (doc.containsKey("pump"))   pumpState   = doc["pump"];
+    if (doc.containsKey("mist"))   mistState   = doc["mist"];
+    if (doc.containsKey("light"))  lightState  = doc["light"];
+
+    applyOutputs();
+  }
+
+  if (uiState == UI_HOME) updateHomeDisplay();
+  else if (uiState == UI_MAIN_MENU) displayMainMenu();
+  else if (uiState == UI_SETTINGS_MENU) displaySettingsMenu();
+  else if (uiState == UI_MANUAL_MENU) displayManualMenu();
 }
 
 //================ OUTPUT =================
@@ -290,7 +490,14 @@ void applyOutputs()
       pumpState != prevPump || mistState != prevMist ||
       lightState != prevLight)
   {
-    sendRelayStatesToSerial();
+    Serial.print("RELAY_STATE:");
+    Serial.print("heater="); Serial.print(heaterState ? 1 : 0);
+    Serial.print(",fan=");   Serial.print(fanState ? 1 : 0);
+    Serial.print(",pump=");  Serial.print(pumpState ? 1 : 0);
+    Serial.print(",mist=");  Serial.print(mistState ? 1 : 0);
+    Serial.print(",light="); Serial.print(lightState ? 1 : 0);
+    Serial.println();
+
     prevHeater = heaterState;
     prevFan = fanState;
     prevPump = pumpState;
@@ -337,7 +544,14 @@ void saveSettings()
   prefs.putFloat("soilHigh", cfg.soilHumiHigh);
   prefs.end();
 
-  sendSettingsToSerial();
+  Serial.print("CFG:");
+  Serial.print("tempLow="); Serial.print(cfg.tempLow, 1);
+  Serial.print(",tempHigh="); Serial.print(cfg.tempHigh, 1);
+  Serial.print(",airHumiLow="); Serial.print(cfg.airHumiLow, 1);
+  Serial.print(",airHumiHigh="); Serial.print(cfg.airHumiHigh, 1);
+  Serial.print(",soilHumiLow="); Serial.print(cfg.soilHumiLow, 1);
+  Serial.print(",soilHumiHigh="); Serial.print(cfg.soilHumiHigh, 1);
+  Serial.println();
 }
 
 //================ PARSE DATA =================
@@ -388,184 +602,6 @@ bool parseDataPacket(const char* packet, SensorData& outData)
   outData.ph         = atof(tokens[9]);
 
   return validateSensorData(outData);
-}
-
-//================ SERIAL COMMANDS =================
-void parseCfgFromSerial(const char* cfgStr)
-{
-  Settings newCfg = cfg;
-
-  char buf[SERIAL_CMD_BUFFER_SIZE];
-  strncpy(buf, cfgStr, sizeof(buf) - 1);
-  buf[sizeof(buf) - 1] = '\0';
-
-  char* savePtr = nullptr;
-  char* pair = strtok_r(buf, ",", &savePtr);
-
-  while (pair != nullptr)
-  {
-    char* eq = strchr(pair, '=');
-    if (eq != nullptr)
-    {
-      *eq = '\0';
-      char* key = pair;
-      float val = atof(eq + 1);
-
-      if (strcmp(key, "tempLow") == 0)            newCfg.tempLow = val;
-      else if (strcmp(key, "tempHigh") == 0)      newCfg.tempHigh = val;
-      else if (strcmp(key, "airHumiLow") == 0)    newCfg.airHumiLow = val;
-      else if (strcmp(key, "airHumiHigh") == 0)   newCfg.airHumiHigh = val;
-      else if (strcmp(key, "soilHumiLow") == 0)   newCfg.soilHumiLow = val;
-      else if (strcmp(key, "soilHumiHigh") == 0)  newCfg.soilHumiHigh = val;
-    }
-    pair = strtok_r(nullptr, ",", &savePtr);
-  }
-
-  validateSettings(newCfg);
-  cfg = newCfg;
-  saveSettings();
-
-  Serial.println(">> CFG updated from web!");
-}
-
-void handleRelayCommand(const char* relayCmd)
-{
-  char cmdCopy[64];
-  strncpy(cmdCopy, relayCmd, sizeof(cmdCopy) - 1);
-  cmdCopy[sizeof(cmdCopy) - 1] = '\0';
-
-  char* colon = strchr(cmdCopy, ':');
-  if (colon == nullptr) return;
-
-  *colon = '\0';
-  char* relayName = cmdCopy;
-  char* stateStr = colon + 1;
-
-  bool validState = false;
-  bool state = false;
-
-  if (strcmp(stateStr, "ON") == 0)
-  {
-    validState = true;
-    state = true;
-  }
-  else if (strcmp(stateStr, "OFF") == 0)
-  {
-    validState = true;
-    state = false;
-  }
-
-  if (!validState) return;
-
-  // CHI CHO DIEU KHIEN TAY KHI DANG MANUAL
-  if (controlMode != MODE_MANUAL)
-  {
-    Serial.println(">> IGNORE: relay command only works in MANUAL mode");
-    return;
-  }
-
-  if (strcmp(relayName, "HEATER") == 0)         { heaterState = state; }
-  else if (strcmp(relayName, "FAN") == 0)       { fanState = state; }
-  else if (strcmp(relayName, "PUMP") == 0)      { pumpState = state; }
-  else if (strcmp(relayName, "MIST") == 0)      { mistState = state; }
-  else if (strcmp(relayName, "LIGHT") == 0)     { lightState = state; }
-  else { return; }
-
-  applyOutputs();
-
-  Serial.print(">> OK: ");
-  Serial.print(relayName);
-  Serial.print(" = ");
-  Serial.println(state ? "ON" : "OFF");
-}
-
-void handleModeCommand(const char* modeCmd)
-{
-  if (strcmp(modeCmd, "AUTO") == 0)
-  {
-    controlMode = MODE_AUTO;
-
-    if (hasValidData)
-      controlOutputsAuto(currentData);
-    else
-      turnOffAllOutputs();
-
-    sendModeToSerial();
-    Serial.println(">> MODE set to AUTO");
-
-    if (uiState == UI_HOME) updateHomeDisplay();
-    else if (uiState == UI_MAIN_MENU) displayMainMenu();
-    else if (uiState == UI_SETTINGS_MENU) displaySettingsMenu();
-    else if (uiState == UI_MANUAL_MENU) displayManualMenu();
-  }
-  else if (strcmp(modeCmd, "MANUAL") == 0)
-  {
-    controlMode = MODE_MANUAL;
-    sendModeToSerial();
-    Serial.println(">> MODE set to MANUAL");
-
-    if (uiState == UI_HOME) updateHomeDisplay();
-    else if (uiState == UI_MAIN_MENU) displayMainMenu();
-    else if (uiState == UI_SETTINGS_MENU) displaySettingsMenu();
-    else if (uiState == UI_MANUAL_MENU) displayManualMenu();
-  }
-}
-
-void handleSerialCommand(const char* cmd)
-{
-  if (strncmp(cmd, "CFG:", 4) == 0)
-  {
-    parseCfgFromSerial(cmd + 4);
-  }
-  else if (strncmp(cmd, "RELAY:", 6) == 0)
-  {
-    handleRelayCommand(cmd + 6);
-  }
-  else if (strncmp(cmd, "MODE:", 5) == 0)
-  {
-    handleModeCommand(cmd + 5);
-  }
-  else if (strcmp(cmd, "GET:MODE") == 0)
-  {
-    sendModeToSerial();
-  }
-  else if (strcmp(cmd, "GET:CFG") == 0)
-  {
-    sendSettingsToSerial();
-  }
-  else if (strcmp(cmd, "GET:RELAY") == 0)
-  {
-    sendRelayStatesToSerial();
-  }
-}
-
-void readSerialCommands()
-{
-  while (Serial.available())
-  {
-    char c = (char)Serial.read();
-
-    if (c == '\n' || c == '\r')
-    {
-      if (serialCmdIndex > 0)
-      {
-        serialCmdBuffer[serialCmdIndex] = '\0';
-        handleSerialCommand(serialCmdBuffer);
-        serialCmdIndex = 0;
-      }
-    }
-    else
-    {
-      if (serialCmdIndex < (SERIAL_CMD_BUFFER_SIZE - 1))
-      {
-        serialCmdBuffer[serialCmdIndex++] = c;
-      }
-      else
-      {
-        serialCmdIndex = 0;
-      }
-    }
-  }
 }
 
 //================ LCD =================
@@ -747,24 +783,35 @@ void displayManualMenu()
 }
 
 //================ BUTTON =================
-bool readButtonEdge(uint8_t pin, bool &lastReading, unsigned long &lastTime)
+bool readButtonPress(ButtonState &btn)
 {
-  bool reading = digitalRead(pin);
-  if (reading != lastReading)
+  bool reading = digitalRead(btn.pin);
+
+  if (reading != btn.lastReading)
   {
-    if (millis() - lastTime > DEBOUNCE_MS)
+    btn.lastDebounceTime = millis();
+    btn.lastReading = reading;
+  }
+
+  if ((millis() - btn.lastDebounceTime) > DEBOUNCE_MS)
+  {
+    if (reading != btn.stableState)
     {
-      lastTime = millis();
-      lastReading = reading;
-      if (reading == LOW) return true;
+      btn.stableState = reading;
+
+      if (btn.stableState == LOW)
+      {
+        return true;
+      }
     }
   }
+
   return false;
 }
 
-bool modePressed() { return readButtonEdge(BTN_MODE, lastModeReading, lastModeMs); }
-bool upPressed()   { return readButtonEdge(BTN_UP, lastUpReading, lastUpMs); }
-bool downPressed() { return readButtonEdge(BTN_DOWN, lastDownReading, lastDownMs); }
+bool modePressed() { return readButtonPress(btnMode); }
+bool upPressed()   { return readButtonPress(btnUp); }
+bool downPressed() { return readButtonPress(btnDown); }
 
 //================ AUTO CONTROL =================
 void controlOutputsAuto(const SensorData& data)
@@ -793,7 +840,6 @@ void controlOutputsAuto(const SensorData& data)
   if (data.soilHumi < cfg.soilHumiLow)       pumpState = true;
   else if (data.soilHumi > cfg.soilHumiHigh) pumpState = false;
 
-  // LIGHT KHONG THAM GIA AUTO
   applyOutputs();
 }
 
@@ -823,7 +869,6 @@ void enterManualMenu()
   uiState = UI_MANUAL_MENU;
   manualMenuIndex = MAN_HEATER;
   controlMode = MODE_MANUAL;
-  sendModeToSerial();
   displayManualMenu();
 }
 
@@ -855,7 +900,6 @@ void handleMainMenuButtons()
     if (mainMenuIndex == MAIN_AUTO)
     {
       controlMode = MODE_AUTO;
-      sendModeToSerial();
 
       if (hasValidData) controlOutputsAuto(currentData);
       else turnOffAllOutputs();
@@ -1029,9 +1073,19 @@ void resetLoRaBuffer()
 
 void handleLoRaChar(char c)
 {
-  if (c == '<') { resetLoRaBuffer(); isReceivingPacket = true; }
+  if (c == '<')
+  {
+    resetLoRaBuffer();
+    isReceivingPacket = true;
+  }
+
   if (!isReceivingPacket) return;
-  if (loraIndex >= (LORA_BUFFER_SIZE - 1)) { resetLoRaBuffer(); return; }
+
+  if (loraIndex >= (LORA_BUFFER_SIZE - 1))
+  {
+    resetLoRaBuffer();
+    return;
+  }
 
   loraBuffer[loraIndex++] = c;
   loraBuffer[loraIndex] = '\0';
@@ -1039,6 +1093,7 @@ void handleLoRaChar(char c)
   if (c == '>')
   {
     SensorData parsedData;
+
     if (parseDataPacket(loraBuffer, parsedData))
     {
       currentData = parsedData;
@@ -1093,6 +1148,21 @@ void setupPins()
   turnOffAllOutputs();
 }
 
+void setupButtons()
+{
+  btnMode.stableState = digitalRead(BTN_MODE);
+  btnMode.lastReading = btnMode.stableState;
+  btnMode.lastDebounceTime = 0;
+
+  btnUp.stableState = digitalRead(BTN_UP);
+  btnUp.lastReading = btnUp.stableState;
+  btnUp.lastDebounceTime = 0;
+
+  btnDown.stableState = digitalRead(BTN_DOWN);
+  btnDown.lastReading = btnDown.stableState;
+  btnDown.lastDebounceTime = 0;
+}
+
 void setup()
 {
   Serial.begin(115200);
@@ -1100,6 +1170,7 @@ void setup()
   Serial.println("=== GATEWAY BOOT ===");
 
   setupPins();
+  setupButtons();
   loadSettings();
 
   Wire.begin(I2C_SDA, I2C_SCL);
@@ -1110,30 +1181,39 @@ void setup()
   lcd.setCursor(0, 0); lcd.print("NHA KINH THONG MINH");
   lcd.setCursor(0, 1); lcd.print("DH SPKT HUNG YEN");
 
+  connectWiFi();
 
   LORA.begin(LORA_BAUD, SERIAL_8N1, LORA_RX, LORA_TX, false, 256);
   resetLoRaBuffer();
-  memset(serialCmdBuffer, 0, sizeof(serialCmdBuffer));
 
-  delay(5000);
+  delay(3000);
 
-  sendSettingsToSerial();
-  sendRelayStatesToSerial();
-  sendModeToSerial();
   Serial.println("=== READY ===");
-
   enterHome();
 }
 
 void loop()
 {
   handleButtons();
-  readSerialCommands();
 
-  if (LORA.available() > 0)
+  while (LORA.available() > 0)
   {
     char c = (char)LORA.read();
     handleLoRaChar(c);
+  }
+
+  ensureWiFiConnected();
+
+  if (millis() - lastUploadMs >= UPLOAD_INTERVAL_MS)
+  {
+    lastUploadMs = millis();
+    uploadDataToServer();
+  }
+
+  if (millis() - lastFetchCmdMs >= FETCH_CMD_INTERVAL_MS)
+  {
+    lastFetchCmdMs = millis();
+    fetchCommandFromServer();
   }
 
   checkNodeTimeout();
