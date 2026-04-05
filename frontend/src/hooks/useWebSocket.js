@@ -2,8 +2,8 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { getAllSensorKeys } from "@/lib/sensorConfig";
+import { WS_URL } from "@/lib/api";
 
-const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000/ws/sensor-data";
 const MAX_HISTORY = 60; // Giữ 60 data points trong buffer
 
 export default function useWebSocket() {

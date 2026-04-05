@@ -1,8 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { API_URL } from "@/lib/api";
 
 const RELAYS = [
   { key: "heater", label: "Sưởi", icon: "🔥", color: "#ef4444", description: "Điều khiển máy sưởi", autoControlled: true },
