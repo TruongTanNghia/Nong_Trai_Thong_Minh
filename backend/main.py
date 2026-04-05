@@ -227,20 +227,29 @@ async def esp32_upload(data: dict):
         latest_data = sensor_data
         await manager.broadcast(sensor_data)
 
-    # ── 2. Cập nhật relay states từ ESP32 (source of truth) ──
-    relay_states["heater"] = bool(data.get("heater", False))
-    relay_states["fan"] = bool(data.get("fan", False))
-    relay_states["pump"] = bool(data.get("pump", False))
-    relay_states["mist"] = bool(data.get("mist", False))
-    relay_states["light"] = bool(data.get("light", False))
+    # ── 2. Cập nhật relay states từ ESP32 ──
+    # ★ CHỈ cập nhật nếu KHÔNG có lệnh relay đang chờ từ web
+    relay_keys = ["heater", "fan", "pump", "mist", "light"]
+    has_pending_relay = any(k in esp32_pending_commands for k in relay_keys)
+    if not has_pending_relay:
+        relay_states["heater"] = bool(data.get("heater", False))
+        relay_states["fan"] = bool(data.get("fan", False))
+        relay_states["pump"] = bool(data.get("pump", False))
+        relay_states["mist"] = bool(data.get("mist", False))
+        relay_states["light"] = bool(data.get("light", False))
     await manager.broadcast({"type": "relay_states", "states": relay_states})
 
     # ── 3. Cập nhật mode từ ESP32 ──
-    auto_mode = (mode_str == "AUTO")
+    # ★ CHỈ cập nhật nếu KHÔNG có lệnh mode đang chờ từ web
+    if "mode" not in esp32_pending_commands:
+        auto_mode = (mode_str == "AUTO")
     await manager.broadcast({"type": "auto_mode", "enabled": auto_mode})
 
     # ── 4. Cập nhật thresholds từ ESP32 ──
-    if data.get("tempLow") is not None:
+    # ★ CHỈ cập nhật nếu KHÔNG có lệnh settings đang chờ từ web
+    threshold_keys = ["tempLow", "tempHigh", "airHumiLow", "airHumiHigh", "soilHumiLow", "soilHumiHigh"]
+    has_pending_thresholds = any(k in esp32_pending_commands for k in threshold_keys)
+    if data.get("tempLow") is not None and not has_pending_thresholds:
         auto_thresholds["temp_low"] = data.get("tempLow", 20.0)
         auto_thresholds["temp_high"] = data.get("tempHigh", 30.0)
         auto_thresholds["air_humi_low"] = data.get("airHumiLow", 60.0)
