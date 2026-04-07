@@ -5,6 +5,7 @@ import useWebSocket from "@/hooks/useWebSocket";
 import SensorCard from "@/components/SensorCard";
 import AIAnalysis from "@/components/AIAnalysis";
 import ControlPanel from "@/components/ControlPanel";
+import AlertPanel from "@/components/AlertPanel";
 import { getAllSensorKeys } from "@/lib/sensorConfig";
 import Link from "next/link";
 
@@ -103,6 +104,9 @@ export default function Home() {
         </div>
       ) : (
         <>
+          {/* ─── Cảnh Báo Sớm ─── */}
+          <AlertPanel sensorData={sensorData} />
+
           {/* Section: Đất */}
           <div className="section-header">
             <span className="section-icon">🌍</span>
