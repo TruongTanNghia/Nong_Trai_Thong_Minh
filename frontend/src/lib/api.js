@@ -1,16 +1,26 @@
-// Tự động phát hiện backend URL dựa trên hostname trình duyệt
-// Nếu mở web bằng http://192.168.0.100:3000 → backend = http://192.168.0.100:8000
-// Nếu mở web bằng http://localhost:3000 → backend = http://localhost:8000
+// ═══════════════════════════════════════════════════════════════
+// Backend URL Detection
+// ═══════════════════════════════════════════════════════════════
+// 1. Nếu có NEXT_PUBLIC_API_URL (Vercel env) → dùng nó (VD: ngrok URL)
+// 2. Nếu localhost:3000 → backend localhost:8000
+// 3. Nếu 192.168.x.x:3000 → backend 192.168.x.x:8000
+
 const getApiUrl = () => {
   if (typeof window === "undefined") return "http://localhost:8000";
+  // Nếu là Vercel (không phải localhost/IP local) → cần env variable
   const host = window.location.hostname;
-  return `http://${host}:8000`;
+  if (host === "localhost" || host.startsWith("192.168.") || host.startsWith("10.")) {
+    return `http://${host}:8000`;
+  }
+  // Vercel / domain khác → phải dùng NEXT_PUBLIC_API_URL
+  return "http://localhost:8000";
 };
 
 const getWsUrl = () => {
-  if (typeof window === "undefined") return "ws://localhost:8000/ws/sensor-data";
-  const host = window.location.hostname;
-  return `ws://${host}:8000/ws/sensor-data`;
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL || getApiUrl();
+  // Chuyển http→ws, https→wss
+  const wsBase = apiUrl.replace("https://", "wss://").replace("http://", "ws://");
+  return `${wsBase}/ws/sensor-data`;
 };
 
 export const API_URL = process.env.NEXT_PUBLIC_API_URL || getApiUrl();

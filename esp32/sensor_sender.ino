@@ -12,7 +12,7 @@ const char* ssid = "Linh Kien GenZ";
 const char* password = "123456789";
 
 // DOI IP NAY THANH IP MAY TINH CHAY BACKEND
-const char* serverBase = "http://192.168.0.100:8000";
+const char* serverBase = "http://192.168.1.183:8000";
 
 // API
 const char* uploadEndpoint = "/api/esp32/upload";

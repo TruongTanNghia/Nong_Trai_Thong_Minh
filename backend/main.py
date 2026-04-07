@@ -655,6 +655,74 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception:
         manager.disconnect(websocket)
 
+# ═══════════════════════════════════════════════════════════════════
+# ★ AI Analysis - Google Gemini
+# ═══════════════════════════════════════════════════════════════════
+
+GEMINI_API_KEY = "AIzaSyCcPsz1skt_lIISiJopzCrh68rqKjFprpM"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+
+@app.post("/api/analysis")
+async def ai_analysis(data: dict):
+    """Phân tích dữ liệu cảm biến bằng Google Gemini AI."""
+    import httpx
+
+    sensor = data.get("sensor_data", {})
+
+    prompt = f"""Bạn là chuyên gia nông nghiệp thông minh. Phân tích dữ liệu cảm biến nhà kính sau và đưa ra đánh giá + khuyến nghị ngắn gọn bằng tiếng Việt:
+
+📊 Dữ liệu:
+- Nhiệt độ không khí: {sensor.get('air_temperature', 'N/A')}°C
+- Độ ẩm không khí: {sensor.get('air_humidity', 'N/A')}%
+- Nhiệt độ đất: {sensor.get('soil_temperature', 'N/A')}°C
+- Độ ẩm đất: {sensor.get('soil_moisture', 'N/A')}%
+- pH đất: {sensor.get('soil_ph', 'N/A')}
+- EC (độ dẫn điện): {sensor.get('ec', 'N/A')} µS/cm
+- Độ mặn: {sensor.get('salinity', 'N/A')}
+- Nitrogen (N): {sensor.get('nitrogen', 'N/A')} mg/kg
+- Phosphorus (P): {sensor.get('phosphorus', 'N/A')} mg/kg
+- Potassium (K): {sensor.get('potassium', 'N/A')} mg/kg
+
+Trả lời theo format:
+🌡️ ĐÁNH GIÁ TỔNG QUAN: (1-2 câu)
+⚠️ CẢNH BÁO: (nếu có thông số bất thường)
+💡 KHUYẾN NGHỊ: (3-5 gợi ý cụ thể)
+🌱 ĐÁNH GIÁ CÂY TRỒNG: (phù hợp trồng gì)
+"""
+
+    gemini_payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 1000,
+        }
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            res = await client.post(GEMINI_URL, json=gemini_payload)
+
+        if res.status_code != 200:
+            print(f"❌ Gemini API error: {res.status_code} - {res.text[:200]}")
+            raise HTTPException(status_code=500, detail=f"Gemini API error: {res.status_code}")
+
+        result = res.json()
+        text = result["candidates"][0]["content"]["parts"][0]["text"]
+
+        print(f"🤖 AI Analysis done: {len(text)} chars")
+
+        return {
+            "analysis": text,
+            "timestamp": datetime.now().isoformat(),
+            "model": "gemini-2.0-flash"
+        }
+
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Gemini API timeout")
+    except Exception as e:
+        print(f"❌ AI Analysis error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # ─── Run ─────────────────────────────────────────────────────────
 
