@@ -150,6 +150,70 @@ zalo_config = load_zalo_config()
 zalo_auto_send: bool = True
 zalo_send_interval: int = zalo_config.get("send_interval", 30)
 
+# ★ Cảnh báo Zalo khi thông số vượt mức
+ALERT_THRESHOLDS = {
+    "air_temperature": {"label": "Nhiệt độ KK", "unit": "°C", "normal": [20, 32], "warning": [15, 38]},
+    "air_humidity":    {"label": "Độ ẩm KK",    "unit": "%",  "normal": [40, 80], "warning": [25, 90]},
+    "soil_temperature":{"label": "Nhiệt độ đất","unit": "°C", "normal": [15, 30], "warning": [10, 35]},
+    "soil_moisture":   {"label": "Độ ẩm đất",   "unit": "%",  "normal": [30, 70], "warning": [20, 80]},
+    "soil_ph":         {"label": "pH đất",      "unit": "",   "normal": [5.5, 7.5], "warning": [4.5, 8.5]},
+    "ec":              {"label": "EC",           "unit": "µS/cm", "normal": [200, 800], "warning": [100, 1200]},
+    "salinity":        {"label": "Độ mặn",      "unit": "mg/L", "normal": [0, 200], "warning": [0, 400]},
+}
+alert_cooldown: dict = {}  # {sensor_key: last_alert_time} — tránh spam
+ALERT_COOLDOWN_SECONDS = 300  # 5 phút giữa mỗi lần cảnh báo cùng sensor
+
+import time as _time
+
+def check_and_send_zalo_alerts(sensor_data: dict):
+    """Kiểm tra thông số và gửi cảnh báo Zalo nếu vượt mức."""
+    global alert_cooldown
+    token = zalo_config.get("bot_token")
+    chat_id = zalo_config.get("chat_id")
+    if not token or not chat_id:
+        return
+
+    now = _time.time()
+    alerts = []
+
+    for key, cfg in ALERT_THRESHOLDS.items():
+        value = sensor_data.get(key)
+        if value is None:
+            continue
+
+        normal_min, normal_max = cfg["normal"]
+        warn_min, warn_max = cfg["warning"]
+        label = cfg["label"]
+        unit = cfg["unit"]
+
+        severity = None
+        if value < warn_min or value > warn_max:
+            severity = "🔴 NGUY HIỂM"
+        elif value < normal_min or value > normal_max:
+            severity = "🟡 LƯU Ý"
+
+        if severity:
+            # Cooldown check
+            last = alert_cooldown.get(key, 0)
+            if now - last < ALERT_COOLDOWN_SECONDS:
+                continue
+            alert_cooldown[key] = now
+
+            direction = "THẤP" if (value < normal_min) else "CAO"
+            alerts.append(f"{severity}: {label} QUÁ {direction}: {value}{unit} (bình thường: {normal_min}-{normal_max}{unit})")
+
+    if alerts:
+        msg = f"🚨 CẢNH BÁO NHÀ KÍNH 🚨\n"
+        msg += f"⏰ {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}\n\n"
+        msg += "\n".join(alerts)
+        msg += f"\n\n💡 Kiểm tra hệ thống ngay!"
+
+        try:
+            send_zalo_text(token, chat_id, msg)
+            print(f"📱 Đã gửi {len(alerts)} cảnh báo Zalo!")
+        except Exception as e:
+            print(f"⚠️ Lỗi gửi cảnh báo Zalo: {e}")
+
 
 async def zalo_periodic_task():
     while True:
@@ -227,6 +291,11 @@ async def esp32_upload(data: dict):
         latest_data = sensor_data
         await manager.broadcast(sensor_data)
 
+        # ★ Gửi cảnh báo Zalo nếu thông số vượt mức
+        try:
+            await asyncio.to_thread(check_and_send_zalo_alerts, sensor_data)
+        except Exception as e:
+            print(f"⚠️ Lỗi check alert: {e}")
     # ── 2. Cập nhật relay states từ ESP32 ──
     # ★ CHỈ cập nhật nếu KHÔNG có lệnh relay đang chờ từ web
     relay_keys = ["heater", "fan", "pump", "mist", "light"]
