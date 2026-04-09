@@ -2,9 +2,9 @@
 
 import { useState } from "react";
 
-// ★ Gọi Gemini trực tiếp từ Frontend — không cần backend
-const GEMINI_API_KEY = process.env.NEXT_PUBLIC_GEMINI_KEY || "AIzaSyDi52_7tUN8q5MENjn3zM_I6n8o2jN5eR8";
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+// ★ Gọi Gemma 3 27B trực tiếp từ Frontend — không cần backend
+const GEMINI_API_KEY = process.env.NEXT_PUBLIC_GEMINI_KEY || "AIzaSyApSruI-xMRpWQlu0ZhdoM2shP4HF-OY2w";
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemma-3-27b-it:generateContent?key=${GEMINI_API_KEY}`;
 
 async function callGemini(sensorData) {
   const prompt = `Bạn là chuyên gia nông nghiệp thông minh. Phân tích dữ liệu cảm biến nhà kính sau và đưa ra đánh giá + khuyến nghị ngắn gọn bằng tiếng Việt:
@@ -125,7 +125,7 @@ export default function AIAnalysis({ sensorData }) {
               </div>
               <div className="analysis-timestamp">
                 🕐 Phân tích lúc: {new Date(analysis.timestamp).toLocaleString("vi-VN")}
-                &nbsp;|&nbsp; 🤖 Model: Gemini 2.0 Flash
+                &nbsp;|&nbsp; 🤖 Model: Gemma 3 27B
               </div>
             </>
           )}
