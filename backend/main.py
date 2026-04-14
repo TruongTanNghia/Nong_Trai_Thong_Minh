@@ -728,7 +728,7 @@ async def websocket_endpoint(websocket: WebSocket):
 # ★ AI Analysis - Google Gemini
 # ═══════════════════════════════════════════════════════════════════
 
-GEMINI_API_KEY = "AIzaSyCcPsz1skt_lIISiJopzCrh68rqKjFprpM"
+GEMINI_API_KEY = "[ENCRYPTION_KEY]"
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 
 @app.post("/api/analysis")
